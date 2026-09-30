@@ -6,6 +6,7 @@
  */
 
 import { existsSync, readFileSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
 import net from 'node:net'
 import { posix } from 'node:path'
 import { Client, type ConnectConfig } from 'ssh2'
@@ -250,6 +251,259 @@ function appendOutput(target: { text: string; truncated: boolean }, chunk: Buffe
     return
   }
   target.text += chunk.toString('utf8')
+}
+
+/** 常驻 shell 会话：命令复用同一条 bash 通道，cd/环境跨命令持久。 */
+export interface PersistentShellSession {
+  /**
+   * Run one command. `cwd` 仅在显式给出且与通道当前目录不同时补 `cd`
+   * 前缀；省略时沿用 shell 当前目录（持久化语义）。超时杀死整条通道并
+   * 返回 timedOut 结果；传输/协议错误自动降级为一次性 exec。
+   */
+  run(command: string, options?: { cwd?: string; timeoutMs?: number }): Promise<ExecResult>
+  /** Close the channel (idempotent); queued command (if any) settles first. */
+  dispose(): Promise<void>
+}
+
+/** Sentinel prefix for one persistent-shell command (unique per run). */
+function shellSentinel(): string {
+  return `__DSH_S_${randomUUID().replaceAll('-', '').slice(0, 16)}__`
+}
+
+/** 常驻 shell 单流累积上限（对齐引擎 maxOutputBytes 默认量级）。 */
+const SHELL_OUTPUT_CAP = 2 * 1024 * 1024
+/** 哨兵跨块拼接的回看窗口（字节）。 */
+const SENTINEL_LOOKBACK = 256
+
+/**
+ * Append one chunk to a capped output buffer and scan for the sentinel
+ * `__DSH_S_<id>__<exit> <pwd>\n`. 哨兵只可能出现在新块内或与前一小段
+ * 跨块拼接处，回看窗口足够；超限后改留滚动尾窗（检测不能停）。
+ */
+function appendShellOutput(
+  target: { text: string; truncated: boolean },
+  chunk: Buffer,
+  sentinel: string,
+  onSentinel: (exitCode: number, pwd: string) => void,
+): void {
+  const previous = Buffer.from(target.text, 'utf8')
+  const merged = Buffer.concat([previous, chunk])
+  const searchFrom = Math.max(0, merged.length - chunk.length - sentinel.length - SENTINEL_LOOKBACK)
+  const marker = merged.indexOf(sentinel, searchFrom)
+  if (marker !== -1) {
+    const lineEnd = merged.indexOf(10, marker)
+    if (lineEnd !== -1) {
+      const before = merged.subarray(0, marker).toString('utf8')
+      target.text = target.truncated ? before : capShellOutput(target, before)
+      const payload = merged.subarray(marker + sentinel.length, lineEnd).toString('utf8')
+      const space = payload.indexOf(' ')
+      const exitCode = Number.parseInt(space === -1 ? payload : payload.slice(0, space), 10)
+      const pwd = space === -1 ? '' : payload.slice(space + 1)
+      onSentinel(Number.isFinite(exitCode) ? exitCode : 0, pwd)
+      return
+    }
+  }
+  const text = merged.toString('utf8')
+  if (target.truncated) {
+    target.text = text.slice(-(sentinel.length + SENTINEL_LOOKBACK))
+  } else {
+    target.text = capShellOutput(target, text)
+  }
+}
+
+/** Cap helper: mark truncation and keep only the sentinel-scan tail window. */
+function capShellOutput(target: { text: string; truncated: boolean }, text: string): string {
+  if (text.length <= SHELL_OUTPUT_CAP) return text
+  target.truncated = true
+  return text.slice(0, SHELL_OUTPUT_CAP) + '…[output truncated]'
+}
+
+/** PersistentShellSession 的引擎内实现（通道重建 + 串行队列 + 降级 + 空闲回收）。 */
+class PersistentShellImpl implements PersistentShellSession {
+  /** 通道绑定：监听器与「当前运行」随通道走（重建后旧通道的事件不串台）。 */
+  private binding: {
+    stream: import('ssh2').ClientChannel
+    current?: {
+      sentinel: string
+      stdout: { text: string; truncated: boolean }
+      stderr: { text: string; truncated: boolean }
+      onSentinel: (exitCode: number, pwd: string) => void
+      abort: (timedOut: boolean) => void
+    }
+  } | undefined
+  private broken = false
+  /** 已知最近目录：显式 cwd / 哨兵 $PWD 维护；通道重建后 cd 回去。 */
+  private resumeCwd: string | undefined
+  private queue: Promise<unknown> = Promise.resolve()
+  private idleTimer: NodeJS.Timeout | undefined
+
+  constructor(
+    private readonly engine: SshEngine,
+    private readonly alias: string,
+    stream: import('ssh2').ClientChannel,
+    initialCwd: string | undefined,
+    private readonly idleMs: number,
+  ) {
+    this.resumeCwd = initialCwd
+    this.bindChannel(stream)
+    if (initialCwd !== undefined) {
+      stream.write(`cd ${quoteSh(initialCwd)}\n`)
+    }
+  }
+
+  /** 绑定一条新通道：监听器常驻整个通道生命周期，不在命令间拆装。 */
+  private bindChannel(stream: import('ssh2').ClientChannel): void {
+    const binding = { stream } as NonNullable<PersistentShellImpl['binding']>
+    this.binding = binding
+    this.broken = false
+    // data/stderr 收集器只在有 current 时投递；哨兵后迟到的字节落进已结算
+    // 命令的累积器（无人再读，无害）——绝不丢、也绝不串进下一条命令。
+    stream.on('data', (chunk: Buffer) => {
+      const current = binding.current
+      if (current !== undefined) appendShellOutput(current.stdout, chunk, current.sentinel, current.onSentinel)
+    })
+    stream.stderr.on('data', (chunk: Buffer) => {
+      const current = binding.current
+      if (current !== undefined) appendShellOutput(current.stderr, chunk, current.sentinel, () => { /* 哨兵只认 stdout */ })
+    })
+    stream.on('close', () => {
+      binding.current?.abort(false)
+      if (this.binding === binding) this.broken = true
+    })
+  }
+
+  async run(command: string, options?: { cwd?: string; timeoutMs?: number }): Promise<ExecResult> {
+    this.disarmIdle()
+    const attempt = this.queue.then(
+      () => this.runOnce(command, options),
+      () => this.runOnce(command, options),
+    )
+    this.queue = attempt.catch(() => undefined)
+    // 空闲回收：会话结束后残留的通道在 idleMs 后自动关闭（连接池按连接
+    // 回收，同连接上的其他会话流量会让它一直活着——这里补通道级回收）。
+    void attempt.finally(() => this.armIdle()).catch(() => undefined)
+    return attempt
+  }
+
+  async dispose(): Promise<void> {
+    this.disarmIdle()
+    await this.queue.catch(() => undefined)
+    this.closeStream()
+  }
+
+  private armIdle(): void {
+    this.disarmIdle()
+    this.idleTimer = setTimeout(() => { this.closeStream() }, this.idleMs)
+    this.idleTimer.unref?.()
+  }
+
+  private disarmIdle(): void {
+    if (this.idleTimer !== undefined) {
+      clearTimeout(this.idleTimer)
+      this.idleTimer = undefined
+    }
+  }
+
+  private closeStream(): void {
+    const binding = this.binding
+    this.binding = undefined
+    this.broken = true
+    try { binding?.stream.close() } catch { /* already closed */ }
+  }
+
+  private async runOnce(command: string, options?: { cwd?: string; timeoutMs?: number }): Promise<ExecResult> {
+    try {
+      return await this.runOnChannel(command, options)
+    } catch (error) {
+      // 传输/协议错误：绝不让命令丢失——降级为一次性 exec（cwd 语义与
+      // 旧路径一致），通道留给下次调用重建。
+      this.closeStream()
+      const fallbackCwd = options?.cwd ?? this.resumeCwd
+      const result = await this.engine.exec(this.alias, command, {
+        ...(fallbackCwd !== undefined ? { cwd: fallbackCwd } : {}),
+        ...(options?.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+      })
+      result.stderr = `${result.stderr}${result.stderr === '' ? '' : '\n'}[persistent shell fell back to one-shot exec: ${error instanceof Error ? error.message : String(error)}]`
+      return result
+    }
+  }
+
+  private async runOnChannel(command: string, options?: { cwd?: string; timeoutMs?: number }): Promise<ExecResult> {
+    if (this.broken || this.binding === undefined) {
+      const reopened = await this.engine.openShellChannel(this.alias)
+      this.bindChannel(reopened.stream)
+      // 重建后恢复到最近已知目录（持久化语义跨重建保持）。
+      if (this.resumeCwd !== undefined) {
+        reopened.stream.write(`cd ${quoteSh(this.resumeCwd)}\n`)
+      }
+    }
+    const binding = this.binding
+    if (binding === undefined) throw new Error('persistent shell: no channel')
+    const stream = binding.stream
+    const started = Date.now()
+    const timeoutMs = options?.timeoutMs ?? 60_000
+    const sentinel = shellSentinel()
+    // 显式 cwd 偏离已知值才补 cd；未显式指定 = 沿用 shell 当前目录。
+    const prefix = options?.cwd !== undefined && options.cwd !== this.resumeCwd ? `cd ${quoteSh(options.cwd)} && ` : ''
+    if (options?.cwd !== undefined) this.resumeCwd = options.cwd
+
+    const stdout: { text: string; truncated: boolean } = { text: '', truncated: false }
+    const stderr: { text: string; truncated: boolean } = { text: '', truncated: false }
+
+    return await new Promise<ExecResult>((resolve) => {
+      let settled = false
+      const finish = (result: ExecResult) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        resolve(result)
+      }
+      const collect = (): ExecResult => ({
+        success: false,
+        exitCode: null,
+        timedOut: false,
+        stdout: stdout.text,
+        stderr: stderr.text,
+        durationMs: Date.now() - started,
+        error: 'persistent shell: channel closed before completion',
+      })
+      const collectTimedOut = (): ExecResult => ({
+        success: false,
+        exitCode: null,
+        timedOut: true,
+        stdout: stdout.text,
+        stderr: stderr.text,
+        durationMs: Date.now() - started,
+      })
+      const onSentinel = (exitCode: number, pwd: string): void => {
+        if (pwd !== '') this.resumeCwd = pwd
+        finish({
+          success: exitCode === 0,
+          exitCode,
+          timedOut: false,
+          stdout: stdout.text,
+          stderr: stderr.text,
+          durationMs: Date.now() - started,
+        })
+      }
+      binding.current = { sentinel, stdout, stderr, onSentinel, abort: timedOut => finish(timedOut ? collectTimedOut() : collect()) }
+      const timer = setTimeout(() => {
+        // 超时：本地立即结算，不等远端确认。先 KILL（杀 bash；孤儿子进程
+        // 由管道断裂兜底），250ms 后 destroy 本地端清理。通道标记 broken，
+        // 下次调用重建并 cd 回恢复目录。
+        try { stream.signal('KILL') } catch { /* gone */ }
+        setTimeout(() => {
+          try { stream.destroy() } catch { /* gone */ }
+          try { stream.close() } catch { /* gone */ }
+        }, 250).unref?.()
+        if (this.binding === binding) this.broken = true
+        finish(collectTimedOut())
+      }, timeoutMs)
+      stream.write(
+        `${prefix}${command}\nprintf '${sentinel}%s %s\\n' "$?" "$PWD"\n`,
+      )
+    })
+  }
 }
 
 /** The engine. Owns the pool, the active IDE connection and all operations. */
@@ -640,6 +894,38 @@ export class SshEngine {
             stream.close()
           },
         })
+      })
+    })
+  }
+
+  /**
+   * 打开一个常驻 shell 会话（B 方案：会话内全部前台命令复用同一条
+   * `bash -l` 通道）。命令经哨兵协议发送/回收：
+   *
+   *   <command>
+   *   printf '__DSH_S_<id>__%s %s\n' "$?" "$PWD"
+   *
+   * 非交互 bash 无 TTY → 无回显无提示符，stdout 就是命令输出本身；哨兵
+   * 行可能紧跟在无换行结尾的输出之后（printf 不补前导换行），因此按
+   * 「哨兵字节串出现位置」切分——命令输出逐字节保留。哨兵同时携带
+   * `$PWD`，作为通道的 cwd 跟踪（显式 cwd 请求只在偏离时补 `cd` 前缀，
+   * 未显式指定时沿用 shell 当前目录——cd/export/conda 跨命令持久化）。
+   *
+   * 超时 = 关闭整条通道（杀死 bash 及其子进程），下次调用自动重建；
+   * 传输/协议错误 = 降级为一次性 exec（保证命令仍被执行）并标记重建。
+   */
+  async openShellSession(alias: string, options?: { initialCwd?: string }): Promise<PersistentShellSession> {
+    const initial = await this.openShellChannel(alias)
+    return new PersistentShellImpl(this, alias, initial.stream, options?.initialCwd, this.opts.idleTimeoutMs)
+  }
+
+  /** Open one raw `bash -l` channel on the host's pooled connection. */
+  async openShellChannel(alias: string): Promise<{ stream: import('ssh2').ClientChannel }> {
+    const record = await this.ensureConnection(alias)
+    return await new Promise<{ stream: import('ssh2').ClientChannel }>((resolve, reject) => {
+      record.client.exec('bash -l', (error, stream) => {
+        if (error !== undefined && error !== null) reject(error)
+        else resolve({ stream })
       })
     })
   }

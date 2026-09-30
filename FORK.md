@@ -84,6 +84,15 @@ applyable with `git apply` onto a fresh upstream clone). Summary of the changes:
    `settings.section` / workspace-picker slots, and the `dsh.bundle.patch`/`dsh.client`
    manifest loading. Upstream's only change is an internal shell-candidate dedup refactor that
    does not touch the wrapped paths — no code changes were needed beyond the peer ranges.
+8. **Feature: persistent session shell** (2026-09-30, plan B) — the shadow `bash` tool now runs
+   foreground commands on ONE per-session `bash -l` channel (sentinel protocol: unique marker +
+   `$?`/`$PWD` per command) instead of a fresh exec channel per call. Measured on a proxied host:
+   ~310 ms → **~50 ms** per command (6×), plus real state persistence — `cd`, `exports`, activated
+   environments survive between calls (explicit `workdir` still forces a cd; the sentinel carries
+   `$PWD` so rebuilds resume the directory). Timeout kills the channel locally at the deadline
+   (KILL signal + destroy; the next call rebuilds), transport errors fall back to one-shot exec
+   so a command is never lost, and idle channels self-close after the engine's idle timeout.
+   `engine.openShellSession()` in `src/engine.ts`; verified live by `test-persistent-live.mjs`.
 
 ## Rebuild (after editing src/ — client/index.js needs no build)
 
@@ -102,7 +111,8 @@ Validate the built lib without any toolchain (works even inside dsh's file sandb
 
 ```powershell
 node test-built-lib.mjs    # in this folder: 5 runtime checks (proxy dial + seam path routing)
-node test-seam-live.mjs flex-1   # LIVE: opens a remote shell + SFTP shapes (needs the host reachable)
+node test-seam-live.mjs flex-1   # LIVE: remote shell + SFTP shapes (needs the host reachable)
+node test-persistent-live.mjs flex-1   # LIVE: persistent shell semantics + perf (needs the host)
 ```
 
 ## Update from upstream

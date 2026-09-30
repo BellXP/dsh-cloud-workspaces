@@ -19,7 +19,7 @@ import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { JobRegistry } from '@deepseek-ai/dsh-jobs'
 import type { ExecResult } from './protocol'
 import type { SshRuntime } from './ssh-service'
-import { quoteSh } from './engine'
+import { quoteSh, type PersistentShellSession } from './engine'
 import { jsonSafe } from './jsonsafe'
 import { debugLog } from './debug-log'
 import { startRemoteJob } from './job-runner'
@@ -154,10 +154,12 @@ function matchGlob(regexp: RegExp, pattern: string, relative: string): boolean {
 /** 构建一个远程会话的遮蔽工具集（bash/read/write/edit/glob/grep/read_image）。 */
 export function buildSessionTools(runtime: SshRuntime, route: SessionRoute, jobs?: JobRegistry | undefined) {
   const engine = runtime.engine
+  /** 会话级常驻 shell（B 方案）：首条前台 bash 时惰性打开，cd/环境跨命令持久。 */
+  let shell: PersistentShellSession | undefined
 
   const bashTool = defineTool({
     name: 'bash',
-    description: 'Run a bash command on the remote server (this session\'s workspace host) and return stdout/stderr/exit code. For long-running commands (installs, builds, test suites) pass run_in_background:true — no timeout applies; poll with job_output / job_list, stop with job_kill.',
+    description: 'Run a bash command on the remote server (this session\'s workspace host) and return stdout/stderr/exit code. Commands run on ONE persistent shell — cwd changes, exports and activated environments persist between calls unless workdir is given (workdir forces a cd). For long-running commands (installs, builds, test suites) pass run_in_background:true — no timeout applies; poll with job_output / job_list, stop with job_kill.',
     parameters: {
       command: { type: 'string', description: 'The bash command to execute.', required: true },
       description: { type: 'string', description: 'Short active-voice description of what the command does (shown in the UI).', required: true },
@@ -211,7 +213,13 @@ export function buildSessionTools(runtime: SshRuntime, route: SessionRoute, jobs
           ...(exec?.agent !== undefined ? { agent: exec.agent as never } : {}),
         }))
       }
-      const result = await engine.exec(route.hostId, args.command, { cwd, timeoutMs: args.timeoutMs })
+      // 前台命令走会话常驻 shell（连接池上复用一条 bash 通道）：
+      // 显式 workdir 才强制 cd，否则沿用 shell 当前目录（持久化语义）。
+      shell ??= await engine.openShellSession(route.hostId, { initialCwd: route.remoteCwd })
+      const result = await shell.run(args.command, {
+        ...(args.workdir !== undefined && args.workdir !== '' ? { cwd } : {}),
+        ...(args.timeoutMs !== undefined ? { timeoutMs: args.timeoutMs } : {}),
+      })
       return jsonSafe({ kind: 'foreground' as const, ...result, exitCode: result.exitCode ?? undefined })
     },
   })
@@ -460,6 +468,7 @@ export function sessionSectionText(cwd: string | undefined): string {
     '## Remote workspace session',
     `This session's workspace is a remote directory: ${route.remoteCwd} on host "${route.hostId}" (connected over SSH).`,
     'Your bash/read/write/edit/glob/grep tools execute on that server; relative paths resolve against the remote directory. Treat the server as your working machine.',
+    'bash runs on ONE persistent remote shell: cd, exports and activated environments persist between calls. Pass workdir only when you must force a specific directory; avoid re-sourcing profiles or re-activating envs each call.',
     'For long-running commands (installs, builds, test suites) pass run_in_background: true to bash, then poll with job_output / job_list / job_kill.',
     'The ssh_exec/ssh_ls/ssh_read/ssh_write tools also target this host automatically (their alias parameter is optional here).',
     'The plugin configuration lives on the DSH host machine, not on the server — do not look for it there.',

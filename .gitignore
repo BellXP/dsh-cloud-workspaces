@@ -13,3 +13,4 @@ build-log.txt
 *.log
 .playwright-mcp/
 .mimosa/
+.commit-msg*.txt
