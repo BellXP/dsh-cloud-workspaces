@@ -6,11 +6,13 @@
  */
 
 import { existsSync, readFileSync } from 'node:fs'
+import net from 'node:net'
 import { posix } from 'node:path'
 import { Client, type ConnectConfig } from 'ssh2'
 import type {
   ConnectionState,
   ExecResult,
+  HttpProxyConfig,
   RemoteDirEntry,
   RemoteFileContent,
   SshAuthKind,
@@ -135,9 +137,72 @@ function buildConnectConfig(entry: SshHostEntry, sock?: ConnectConfig['sock'], r
   return config
 }
 
-/** Connect one ssh2 client (resolve on ready, reject on error/close). */
-function connectClient(config: ConnectConfig, password?: string): Promise<Client> {
+/**
+ * Dial `host:port` through an HTTP CONNECT proxy (Basic auth when
+ * credentials are configured). Resolves with the raw tunnel socket once the
+ * proxy answers `200` — the caller hands it to ssh2 via `config.sock`, which
+ * then runs the SSH handshake end-to-end through the tunnel. Rejects on any
+ * non-200 answer, socket error, or the deadline.
+ */
+export async function connectHttpProxy(
+  proxy: HttpProxyConfig,
+  host: string,
+  port: number,
+  timeoutMs: number,
+): Promise<net.Socket> {
+  if (/[\r\n]/.test(host)) throw new Error('http proxy: target host must not contain CR/LF')
+  const credentials = proxy.username !== undefined && proxy.username !== ''
+    ? Buffer.from(`${proxy.username}:${proxy.password ?? ''}`, 'utf8').toString('base64')
+    : undefined
   return new Promise((resolve, reject) => {
+    const socket = net.connect(proxy.port, proxy.host)
+    let settled = false
+    const succeed = (value: net.Socket) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      socket.removeListener('error', fail)
+      resolve(value)
+    }
+    const fail = (error: Error) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      socket.destroy()
+      reject(error instanceof Error ? error : new Error(String(error)))
+    }
+    const timer = setTimeout(() => fail(new Error(`http proxy ${proxy.host}:${proxy.port}: CONNECT timed out after ${timeoutMs} ms`)), timeoutMs)
+    socket.on('error', fail)
+    socket.once('connect', () => {
+      socket.write(
+        `CONNECT ${host}:${port} HTTP/1.1\r\n` +
+        `Host: ${host}:${port}\r\n` +
+        `Proxy-Connection: keep-alive\r\n` +
+        (credentials === undefined ? '' : `Proxy-Authorization: Basic ${credentials}\r\n`) +
+        `\r\n`
+      )
+    })
+    let buffered = Buffer.alloc(0)
+    const onData = (chunk: Buffer) => {
+      buffered = Buffer.concat([buffered, chunk])
+      const end = buffered.indexOf('\r\n\r\n')
+      if (end === -1) return
+      socket.removeListener('data', onData)
+      const statusLine = buffered.slice(0, buffered.indexOf('\r\n')).toString()
+      if (!/^HTTP\/1\.[01] 200\b/.test(statusLine)) {
+        fail(new Error(`http proxy ${proxy.host}:${proxy.port} said: ${statusLine}`))
+        return
+      }
+      const rest = buffered.slice(end + 4)
+      if (rest.length > 0) socket.unshift(rest)
+      succeed(socket)
+    }
+    socket.on('data', onData)
+  })
+}
+
+/** Connect one ssh2 client (resolve on ready, reject on error/close). */
+function connectClient(config: ConnectConfig, password?: string): Promise<Client> {  return new Promise((resolve, reject) => {
     const client = new Client()
     // Permanent guard: an ssh2 Client whose 'error' event has no listener
     // makes Node throw and kill the process. The once() handlers below only
@@ -268,6 +333,7 @@ export class SshEngine {
     user: string
     auth: { kind: SshAuthKind; keyPath?: string; passphrase?: string; password?: string }
     proxyJump?: string[]
+    httpProxy?: HttpProxyConfig
   }): Promise<TestResult> {
     const entry: SshHostEntry = {
       alias: '(probe)',
@@ -276,6 +342,7 @@ export class SshEngine {
       user: config.user,
       auth: config.auth,
       proxyJump: config.proxyJump ?? [],
+      httpProxy: config.httpProxy,
       tags: [],
       createdAt: 0,
       updatedAt: 0,
@@ -298,6 +365,8 @@ export class SshEngine {
         const opened = await this.connectHops(entry)
         for (const hop of opened) hops.push(hop.client)
         config.sock = opened[opened.length - 1]!.sock
+      } else if (entry.httpProxy !== undefined) {
+        config.sock = await connectHttpProxy(entry.httpProxy, entry.host, entry.port, this.opts.connectTimeoutMs)
       }
       client = await connectClient(config, password)
       const ok = await new Promise<boolean>((resolve) => {
@@ -358,6 +427,8 @@ export class SshEngine {
         const hops = await this.connectHops(entry)
         config.sock = hops[hops.length - 1]!.sock
         record.hops = hops.map(h => h.client)
+      } else if (entry.httpProxy !== undefined) {
+        config.sock = await connectHttpProxy(entry.httpProxy, entry.host, entry.port, this.opts.connectTimeoutMs)
       }
       let client: Client
       try {
@@ -403,6 +474,10 @@ export class SshEngine {
       if (hop === undefined) throw new Error(`jump host not found: ${hopAlias}`)
       const config = buildConnectConfig(hop, undefined, this.opts.connectTimeoutMs)
       if (hops.length > 0) config.sock = hops[hops.length - 1]!.sock
+      else if (hop.httpProxy !== undefined) {
+        // The chain's first dial honours the first hop's own HTTP proxy.
+        config.sock = await connectHttpProxy(hop.httpProxy, hop.host, hop.port, this.opts.connectTimeoutMs)
+      }
       const client = await connectClient(config, hop.auth.kind === 'password' ? hop.auth.password : undefined)
       const sock = (client as unknown as { sock: import('node:net').Socket }).sock
       hops.push({ client, sock })

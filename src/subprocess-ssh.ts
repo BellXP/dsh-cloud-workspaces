@@ -1065,6 +1065,28 @@ export class SshTerminalHandle implements SubprocessTerminalHandle {
     })
   }
 
+  /**
+   * 0.1.7 seam member（终端控制器在 resize 请求里调用）：转发到远端 PTY。
+   * shell 退出后 resize 是 no-op（与本地 provider 一致——控制器只对
+   * state:"running" 的终端发 resize）。
+   */
+  resize(cols: number, rows: number): Promise<void> {
+    return this.trackOperation(async (signal) => {
+      signal.throwIfAborted()
+      if (this.topLevelExited) return
+      this.shell.resize(cols, rows)
+    })
+  }
+
+  /**
+   * 0.1.7 seam member：SSH 底座无法可靠观测交互 shell 的生命周期/作业状态，
+   * 恒报 unknown（契约允许——效果只是禁用无窗口空闲自动回收，终端保留到
+   * 显式关闭或 owner 卸载）。
+   */
+  inspectActivity(): Promise<{ state: 'idle' | 'busy' | 'unknown'; revision: number }> {
+    return Promise.resolve({ state: 'unknown', revision: 0 })
+  }
+
   /** @inheritdoc */
   inspectForeground(): Promise<SubprocessTerminalForeground | undefined> {
     return this.trackOperation(signal => this.inspectForegroundOnce(signal))
@@ -1199,14 +1221,19 @@ export async function spawnSshTerminal(
     // The login shell prints the marker, publishes its pid, then replaces
     // itself with the requested argv (spec.env becomes a shell-prefix overlay;
     // the PTY keeps the login environment — see the module doc).
+    // 0.1.7 侧边栏终端路由（seam-terminal）：argv 为空 = 保留远端交互登录
+    // shell（不 exec），仅 cd 到工作区；此时 spec.cwd 是远端绝对路径。
     const argvLine = spec.argv.map(quoteShellArg).join(' ')
     const envPrefix = Object.entries(spec.env ?? {}).map(([name, value]) => `${name}=${quoteShellArg(value)} `).join('')
+    const launch = spec.argv.length > 0
+      ? `${envPrefix}exec ${argvLine}`
+      : spec.cwd !== undefined && posix.isAbsolute(spec.cwd) ? `cd ${quoteShellArg(spec.cwd)}` : ''
     // `\\n` stays a literal backslash-n in the injected text so the remote
     // shell's printf interprets it as the standard newline escape.
     const command = [
       `printf ${quoteShellArg(`${outputMarker}\\n`)}`,
       `printf ${quoteShellArg('%s\\n')} "$$" > ${quoteShellArg(paths.pid)}`,
-      `${envPrefix}exec ${argvLine}\r`,
+      `${launch}\r`,
     ].join('; ')
     shell.send(command)
     const exitState = Promise.withResolvers<{ code: number | null }>()

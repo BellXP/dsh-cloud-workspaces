@@ -3,7 +3,10 @@ lib/
 dist/
 *.tgz
 .research/
+.pnpm-store/
 .pnpm-store-local/
+.tmp-test-store.json
+build-log.txt
 .env
 .npmrc
 .DS_Store

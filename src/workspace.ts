@@ -87,6 +87,36 @@ export function mapLocalToRemote(localPath: unknown, env?: NodeJS.ProcessEnv): {
   return { hostId, remotePath }
 }
 
+/**
+ * 本地路径 → { hostId, remotePath, remoteRootPath, placeholderRoot } | null。
+ * 与 mapLocalToRemote 的区别：后者只认「恰好两段」的工作区根本身（会话
+ * cwd 判定用）；本函数接受占位树内**任意深度**——
+ *   <root>/<hostId>/<encoded-root>/子/路径 → 远端 <decoded-root>/子/路径
+ * ——fs seam 的文件级路由依据（侧边栏文件树的 targetKey 全是这种形态）。
+ * 编码段可逆性守卫同 mapLocalToRemote；段内穿越（..）由 path 语义排除。
+ */
+export function mapLocalTreeToRemote(localPath: unknown, env?: NodeJS.ProcessEnv): {
+  hostId: string
+  remotePath: string
+  remoteRootPath: string
+  placeholderRoot: string
+} | null {
+  if (typeof localPath !== 'string' || localPath.length === 0) return null
+  const root = remoteRoot(env)
+  const rel = path.relative(root, localPath)
+  if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) return null
+  const segments = rel.split(path.sep)
+  if (segments.length < 2) return null
+  const hostId = segments[0]!
+  const encoded = segments[1]!
+  if (!isValidHostId(hostId)) return null
+  const remoteRootPath = decodeRemotePath(encoded)
+  if (remoteRootPath === null || !remoteRootPath.startsWith('/')) return null
+  const placeholderRoot = path.join(root, hostId, encoded)
+  const rest = segments.slice(2).filter(segment => segment !== '' && segment !== '.' && segment !== '..')
+  return { hostId, remotePath: posix.join(remoteRootPath, ...rest), remoteRootPath, placeholderRoot }
+}
+
 /** 路由入口：会话 cwd 恰为占位路径 → remote；否则 local（绝不抛错）。 */
 export function routeByCwd(cwd: unknown, env?: NodeJS.ProcessEnv): { kind: 'local' } | { kind: 'remote'; hostId: string; remoteCwd: string } {
   const mapped = mapLocalToRemote(cwd, env)

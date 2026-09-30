@@ -4,38 +4,39 @@
  * 免 preset 的「云端工作区」模式：工作区选择器（client 半双 tab）选定远程
  * 目录后，会话内官方同名工具（bash/read/write/edit/glob/grep）经 agent/created
  * 钩子在 agent scope 遮蔽为 SSH 实现（session-tools），另有全局 ssh_* 工具
- * （tools）、设置卡主机管理（host-settings + typert）。agent-presets/remote-legacy
- * 保留 fs/subprocess 真 seam 替换路线作参考，不再部署。
+ * （tools）、设置卡主机管理（host-settings + typert）。0.1.7 起 Web 侧边栏
+ * 文件树与终端经 seam 路由（seam-fs / seam-terminal）同样落远程；
+ * agent-presets/remote-legacy 保留整服务替换路线作参考，不再部署。
  *
  * Host entries live in ~/.dsh/dsh-remote-ide.json (0600, import from
  * ~/.ssh/config) plus the settings namespace the web settings card edits.
  */
 
 import type { Context } from '@deepseek-ai/cordis'
-import { installSettingsSection, settingsNamespace } from '@deepseek-ai/dsh-settings'
 import type { JobRegistry } from '@deepseek-ai/dsh-jobs'
 import z from 'schemastery'
 import type {} from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-system-prompt'
 import SshRuntime from './ssh-service'
 import { sshExecTool, sshListTool, sshLsTool, sshReadTool, sshWorkspaceTool, sshWriteTool } from './tools'
-import { installHostSettings } from './host-settings'
 import { HOST_TYPERT_CONTRIBUTION, REMOTE_SERVICE, SshRemoteService } from './typert'
 import { installSessionRouting, sessionSectionText } from './session-tools'
+import { installRemoteFsSeam } from './seam-fs'
+import { installRemoteTerminalSeam } from './seam-terminal'
 import { routeByCwd } from './workspace'
+import { debugLog } from './debug-log'
+
+/** Re-exported for consumers that dial HTTP CONNECT proxies directly. */
+export { connectHttpProxy } from './engine'
+/** Seam 路由纯函数（离线/真机验证脚本与消费方共用同一份逻辑）。 */
+export { routeFsPath, routeFsTarget, placeholderKeyFor } from './seam-fs'
+export { mapLocalTreeToRemote } from './workspace'
 
 /** Stable cordis plugin name. */
 export const name = 'remote-ide'
 
 /** Services required before the surfaces can mount. */
 export const inject = ['tools', 'systemPrompt']
-
-/**
- * Settings namespace of the remote-IDE capability — the section the web
- * settings surface edits. Spelled here rather than imported: the browser
- * half spells the same value and must not depend on a Host package.
- */
-export const REMOTE_IDE_SETTINGS_NAMESPACE = settingsNamespace('dsh-remote-ide')
 
 /** Plugin config, validated by the same-named schemastery schema. */
 export interface Config {
@@ -148,25 +149,23 @@ export async function apply(ctx: Context, config?: Config): Promise<void> {
     }
   }
 
-  installSettingsSection(ctx, REMOTE_IDE_SETTINGS_NAMESPACE, Config, config ?? {}, {
-    setSource: (source) => {
-      current = source
-      sync()
-    },
-    onChange: sync,
-  })
-
-  // Settings-card host config namespace + Typert endpoints. Mounted only when
-  // the official settings/typert services exist (the web profile supplies
-  // both; headless runs simply skip them — tools keep working via the store).
-  ctx.inject(['typert', 'settings'], (scope) => {
-    const settingsScope = installHostSettings(scope)
-    const remote = new SshRemoteService(scope, runtime)
-    remote.setSettings(settingsScope)
-    // 严格描述符注册（face:'host' + invocations）；gateway 的 claimsEndpoint
-    // 按 local 注册表命中端点，SRC 回退无需装饰器。
-    scope.typert.register(HOST_TYPERT_CONTRIBUTION)
-    scope.logger?.info('[dsh-remote-ide] typert remote ' + REMOTE_SERVICE + ' registered')
+  // Typert endpoints (设置卡片的数据面：主机 CRUD 直接读写 0600 的 HostStore)。
+  // Mounted only when the official typert service exists (the web profile
+  // supplies it; headless runs simply skip them — tools keep working via the
+  // store).
+  ctx.inject(['typert'], (scope) => {
+    debugLog('typert service available — registering ssh-remote contribution')
+    try {
+      const remote = new SshRemoteService(scope, runtime)
+      // 严格描述符注册（face:'host' + invocations）；gateway 的 claimsEndpoint
+      // 按 local 注册表命中端点，SRC 回退无需装饰器。
+      scope.typert.register(HOST_TYPERT_CONTRIBUTION)
+      debugLog(`typert contribution registered: ssh-remote (${HOST_TYPERT_CONTRIBUTION.invocations.length} invocations)`)
+      scope.logger?.info('[dsh-remote-ide] typert remote ' + REMOTE_SERVICE + ' registered')
+    } catch (error) {
+      debugLog(`typert registration FAILED: ${error instanceof Error ? error.message : String(error)}`)
+      throw error
+    }
   })
 
   // 免 preset 的透明会话路由（核心竞争力）：agent/created 看会话 cwd，占位
@@ -174,6 +173,13 @@ export async function apply(ctx: Context, config?: Config): Promise<void> {
   // 遮蔽工具（经共享 SshEngine 落远程）。enabled 开关在事件时求值——设置面
   // 的启停即时生效。工具注册仍走上面的 sync()（announceToAgent 开关）。
   installSessionRouting(ctx, runtime, () => resolve().enabled === true, () => ctx.get('jobs') as JobRegistry | undefined)
+
+  // 官方 UI seam 路由（0.1.7）：Web 侧边栏文件树/文件预览走 ctx.fs，侧边栏
+  // 终端走 ctx.subprocess.spawnTerminal——路径/cwd 落在占位树下时路由到
+  // SSH 引擎（SFTP / 远端 PTY），其余透传本地实现。服务可用时经 ctx.inject
+  // 触发（web 组合必有；headless 缺失则静默跳过）。
+  installRemoteFsSeam(ctx, runtime, () => resolve().enabled === true)
+  installRemoteTerminalSeam(ctx, runtime, () => resolve().enabled === true)
 
   // Initial registration from the composition entry (covers deployments with
   // no settings service, whose installSettingsSection never fires its hooks).

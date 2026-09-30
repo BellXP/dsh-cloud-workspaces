@@ -18,9 +18,9 @@ import { Service } from '@deepseek-ai/cordis'
 import type { Context } from '@deepseek-ai/cordis'
 import { bindTypertRemote } from '@deepseek-ai/dsh-typert-protocol'
 import type { TypertCodec } from '@deepseek-ai/dsh-typert-protocol'
-import type { SettingsProvider, SettingsScope } from '@deepseek-ai/dsh-settings'
 import type { SshRuntime } from './ssh-service'
-import { HOSTS_NAMESPACE, hostsOf, redactHosts, toHostPayload, type SshHostConfig } from './host-settings'
+import type { SshHostConfig } from './host-settings'
+import type { HostPayload } from './protocol'
 import { createPlaceholderDir, listPlaceholders } from './workspace'
 import { jsonSafe } from './jsonsafe'
 import { debugLog } from './debug-log'
@@ -115,9 +115,6 @@ export class SshRemoteService extends Service {
   private readonly runtime: SshRuntime
   /** 宿主 ctx（workspaceRegistry 等可选服务经 ctx.get 读取）。 */
   private readonly runtimeCtx: Context
-  private settingsScope: SettingsScope<{ hosts: Record<string, SshHostConfig> }> | undefined
-  /** provider 级句柄（scope 无 mutate；单键 unset 需 ctx.settings.mutate）。 */
-  private readonly settingsProvider: SettingsProvider
   /** 绑定声明——gateway validateBinding 按此反射名检查，不可改名。 */
   readonly typertRemote: unknown
 
@@ -125,66 +122,35 @@ export class SshRemoteService extends Service {
     super(ctx, REMOTE_SERVICE)
     this.runtime = runtime
     this.runtimeCtx = ctx
-    this.settingsProvider = ctx.settings
     this.typertRemote = bindTypertRemote(this, REMOTE_SERVICE)
   }
 
-  /** 注入 settings scope（index.ts 的 inject 段在构造后立即调用）。 */
-  setSettings(scope: SettingsScope<{ hosts: Record<string, SshHostConfig> }>): void {
-    this.settingsScope = scope
-    // 一次性迁移：历史版本把明文口令随 settings 落盘（settings.yaml 的 ACL
-    // 宽于专属 store）——迁入 0600 store 并从 settings 文档剥离。
-    void this.migratePasswordsIntoStore().catch((error) => {
-      debugLog(`migration crashed: ${error instanceof Error ? error.message : String(error)}`)
-    })
-  }
-
-  /** 一次性迁移：settings 既有明文口令迁入 0600 store 并从 settings 文档剥离。 */
-  private async migratePasswordsIntoStore(): Promise<void> {
-    const hosts = this.hosts()
-    const withPassword = Object.entries(hosts).filter(([, cfg]) => typeof cfg.password === 'string' && cfg.password !== '')
-    debugLog(`migration: start hosts=${Object.keys(hosts).length} withPassword=${withPassword.length}`)
-    let changed = false
-    for (const [id, cfg] of withPassword) {
-      changed = true
-      try {
-        this.runtime.engine.upsertHost(toHostPayload({ ...cfg }), id)
-        debugLog(`migration: password migrated to store for ${id}`)
-      } catch (error) {
-        debugLog(`migration: store upsert failed for ${id}: ${error instanceof Error ? error.message : String(error)}`)
-      }
-      const stripped: SshHostConfig = { ...cfg }
-      delete stripped.password
-      hosts[id] = stripped
-    }
-    if (changed) {
-      try {
-        await this.settings.update({ hosts })
-        debugLog('migration: settings.update committed (password stripped)')
-      } catch (error) {
-        debugLog(`migration: settings.update failed: ${error instanceof Error ? error.message : String(error)}`)
-      }
-    }
-  }
-
-  private get settings(): SettingsScope<{ hosts: Record<string, SshHostConfig> }> {
-    if (this.settingsScope === undefined) throw new Error('ssh-remote: settings scope not injected yet')
-    return this.settingsScope
-  }
-
   private hosts(): Record<string, SshHostConfig> {
-    return hostsOf(this.settings.get())
-  }
-
-  /** 桥接当前 settings 主机进 HostStore（ssh_* 工具与占位路由立即可用）。 */
-  private syncStore(): void {
-    for (const cfg of Object.values(this.hosts())) {
-      try {
-        this.runtime.engine.upsertHost(toHostPayload(cfg), cfg.id)
-      } catch {
-        // 主机残缺（表单未提交完整）→ 跳过，不影响其它主机。
+    // 0.1.7 迁移：settings 镜像退役，主机清单直接来自 0600 的 HostStore。
+    const out: Record<string, SshHostConfig> = {}
+    for (const summary of this.runtime.engine.list()) {
+      const entry = this.runtime.getStoredEntry(summary.alias)
+      if (entry === undefined) continue
+      out[summary.alias] = {
+        id: summary.alias,
+        name: entry.description,
+        host: entry.host,
+        port: entry.port,
+        user: entry.user,
+        authType: entry.auth.kind,
+        privateKeyPath: entry.auth.kind === 'key' ? entry.auth.keyPath ?? '' : '',
+        proxyJump: [...entry.proxyJump],
+        httpProxy: entry.httpProxy === undefined
+          ? undefined
+          : {
+              host: entry.httpProxy.host,
+              port: entry.httpProxy.port,
+              ...(entry.httpProxy.username !== undefined ? { username: entry.httpProxy.username } : {}),
+            },
+        description: entry.description,
       }
     }
+    return out
   }
 
   // ------------------------------------------------------------ endpoints
@@ -195,59 +161,64 @@ export class SshRemoteService extends Service {
     for (const summary of this.runtime.engine.list()) {
       secrets[summary.alias] = summary.auth === 'password'
     }
-    return jsonSafe({ hosts: redactHosts(this.hosts()), secrets })
+    const hosts = this.hosts()
+    debugLog(`listHosts: ${Object.keys(hosts).length} host(s): ${Object.keys(hosts).join(', ') || '(none)'}`)
+    return jsonSafe({ hosts, secrets })
   }
 
   /**
-   * 创建或更新主机：非敏感配置写 settings；**口令只写 0600 的
-   * dsh-remote-ide.json**——settings.yaml 的 ACL 宽于专属 store（沙箱用户组
-   * 可读），明文口令落那里就是泄露。口令留空 = 沿用 store 既有口令。
+   * 创建或更新主机：**直接写 0600 的 dsh-remote-ide.json**（唯一权威存储）。
+   * 口令/代理口令 write-only：提交留空 = 沿用 store 既有值。
+   * httpProxy: 省略沿用；`null` 显式清除；对象口令留空 = 沿用 store 口令。
    */
-  async saveHost(id: string, patch: Partial<SshHostConfig>): Promise<{ id: string }> {
-    const current = this.hosts()
-    const prev = current[id]
-    const next: SshHostConfig = {
-      id,
-      name: patch.name ?? prev?.name,
-      host: (patch.host ?? prev?.host ?? '').trim(),
-      port: patch.port ?? prev?.port ?? 22,
-      user: (patch.user ?? prev?.user ?? '').trim(),
-      authType: patch.authType ?? prev?.authType ?? 'key',
-      privateKeyPath: patch.privateKeyPath ?? prev?.privateKeyPath,
-      proxyJump: patch.proxyJump ?? prev?.proxyJump,
-      description: patch.description ?? prev?.description,
+  async saveHost(
+    id: string,
+    patch: Partial<Omit<SshHostConfig, 'httpProxy'>> & { httpProxy?: SshHostConfig['httpProxy'] | null },
+  ): Promise<{ id: string }> {
+    debugLog(`saveHost: enter id=${JSON.stringify(id)} patchKeys=${JSON.stringify(Object.keys(patch))}`)
+    try {
+      const stored = this.runtime.getStoredEntry(id)
+      const host = (patch.host ?? stored?.host ?? '').trim()
+      const user = (patch.user ?? stored?.user ?? '').trim()
+      if (host === '' || user === '') {
+        throw new Error('host and user are required')
+      }
+      const port = patch.port ?? stored?.port ?? 22
+      const authType = patch.authType ?? stored?.auth.kind ?? 'key'
+      // 口令解析：新提交的口令优先，否则沿用 0600 store 既有口令。
+      let password: string | undefined
+      if (typeof patch.password === 'string' && patch.password !== '') password = patch.password
+      else if (stored?.auth.kind === 'password') password = stored.auth.password
+      let auth: HostPayload['auth']
+      if (authType === 'password') {
+        auth = { kind: 'password', password: password ?? '' }
+      } else {
+        const keyPath = patch.privateKeyPath ?? (stored?.auth.kind === 'key' ? stored.auth.keyPath : undefined)
+        if (keyPath === undefined || keyPath === '') throw new Error('privateKeyPath is required for key auth')
+        auth = { kind: 'key', keyPath }
+      }
+      // 代理口令同样 write-only：patch 口令留空时 store 会沿用既有值。
+      this.runtime.engine.upsertHost({
+        alias: id,
+        host,
+        port,
+        user,
+        auth,
+        proxyJump: patch.proxyJump ?? stored?.proxyJump ?? [],
+        httpProxy: patch.httpProxy === undefined ? undefined : patch.httpProxy,
+        description: patch.description ?? patch.name ?? stored?.description,
+      }, id)
+      debugLog(`saveHost: ok alias=${JSON.stringify(id)} host=${JSON.stringify(host)} port=${port} auth=${authType}`)
+      return { id }
+    } catch (error) {
+      debugLog(`saveHost: FAILED id=${JSON.stringify(id)} — ${error instanceof Error ? error.message : String(error)}`)
+      throw error
     }
-    if (next.host === '' || next.user === '') {
-      throw new Error('host and user are required')
-    }
-    // 口令解析：新提交的口令优先，否则沿用 0600 store 既有口令。
-    const stored = this.runtime.getStoredEntry(id)
-    const password = typeof patch.password === 'string' && patch.password !== ''
-      ? patch.password
-      : (stored?.auth.kind === 'password' ? stored.auth.password : undefined)
-    // 口令先进 0600 store（权威存储）；store 校验失败则 settings 不落半套配置。
-    this.runtime.engine.upsertHost({
-      alias: id,
-      host: next.host,
-      port: next.port,
-      user: next.user,
-      auth: next.authType === 'password'
-        ? { kind: 'password', password: password ?? '' }
-        : { kind: 'key', keyPath: next.privateKeyPath ?? '' },
-      proxyJump: next.proxyJump ?? [],
-      description: next.description,
-    }, id)
-    const hosts = { ...current, [id]: next }
-    await this.settings.update({ hosts })
-    return { id }
   }
 
-  /** 删除主机：settings 单键 unset + store 断开删除。 */
+  /** 删除主机：0600 store 权威删除（断开连接一并处理）。 */
   async deleteHost(id: string): Promise<{ id: string }> {
-    const current = this.hosts()
-    if (current[id] === undefined) throw new Error(`host not found: ${id}`)
-    // settings.mutate 单键 unset（scope.update 是递归 merge，删不掉键）。
-    await this.settingsProvider.mutate(HOSTS_NAMESPACE, [{ op: 'unset', path: ['hosts', id] }])
+    if (this.runtime.getStoredEntry(id) === undefined) throw new Error(`host not found: ${id}`)
     this.runtime.engine.removeHost(id)
     return { id }
   }
@@ -265,6 +236,7 @@ export class SshRemoteService extends Service {
     privateKeyPath?: string
     password?: string
     proxyJump?: string[]
+    httpProxy?: { host: string; port: number; username?: string; password?: string }
   }): Promise<{ ok: boolean; latencyMs?: number; error?: string }> {
     let password = cfg.password
     let privateKeyPath = cfg.privateKeyPath
@@ -277,6 +249,17 @@ export class SshRemoteService extends Service {
         privateKeyPath = stored.auth.keyPath
       }
     }
+    // 代理口令同样 write-only：UI 提交缺口令时从 0600 store 补回。
+    // cfg.httpProxy 整体缺省时同样回退到已保存代理：设置卡的测试按钮不回传
+    // 代理字段，缺了这个回退，「仅代理可达」主机的测试会绕开代理直连，
+    // 15 秒后报 "Timed out while waiting for handshake"（真机 flex-* 踩过）。
+    let httpProxy = cfg.httpProxy
+    if (httpProxy === undefined && stored?.httpProxy !== undefined) {
+      httpProxy = stored.httpProxy
+    }
+    if (httpProxy !== undefined && (httpProxy.password === undefined || httpProxy.password === '') && stored?.httpProxy !== undefined) {
+      httpProxy = { ...httpProxy, password: stored.httpProxy.password }
+    }
     const result = await this.runtime.engine.testConfig({
       host: cfg.host,
       port: cfg.port,
@@ -285,6 +268,7 @@ export class SshRemoteService extends Service {
         ? { kind: 'password', password }
         : { kind: 'key', keyPath: privateKeyPath },
       proxyJump: cfg.proxyJump,
+      httpProxy,
     })
     // 成功时 error === undefined：必须剥离，否则网关边界校验拒绝整个结果。
     return jsonSafe({ ok: result.ok, latencyMs: result.latencyMs, error: result.error })
@@ -292,27 +276,23 @@ export class SshRemoteService extends Service {
 
   /** 列远端目录（工作区创建浏览；需主机已在 store，未保存先桥接）。 */
   async listRemoteDir(hostId: string, path: string): Promise<unknown> {
-    this.syncStore()
     return jsonSafe(await this.runtime.engine.ls(hostId, path))
   }
 
   /** 在远端创建目录（递归创建父级）。 */
   async mkdirRemote(hostId: string, path: string): Promise<{ path: string }> {
-    this.syncStore()
     await this.runtime.engine.mkdir(hostId, path)
     return { path }
   }
 
   /** 删除远端文件或空目录（非空目录请先清空内容）。 */
   async removeRemote(hostId: string, path: string): Promise<{ path: string }> {
-    this.syncStore()
     await this.runtime.engine.remove(hostId, path)
     return { path }
   }
 
   /** 创建占位工作区（返回本地占位路径，供用户选为 DSH 工作区）。 */
   async createPlaceholder(hostId: string, remotePath: string): Promise<{ localPath: string; hostId: string; remotePath: string }> {
-    this.syncStore()
     const created = await createPlaceholderDir({ hostId, remotePath })
     // 注册进 registry 只是「出现在选择列表」的锦上添花，绝不阻塞端点：
     // registry 启动依赖 sessionPersistence 完成引导，在部分作用域可能永远

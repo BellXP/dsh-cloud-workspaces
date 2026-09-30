@@ -10,6 +10,23 @@ import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import type { HostPayload, ImportResult, SshHostEntry, SshHostSummary } from './protocol'
 
+/** Reject control characters that could split a CONNECT request line. */
+function isHeaderSafe(value: string): boolean {
+  return !/[\r\n]/.test(value)
+}
+
+/** Validate an optional httpProxy payload (throws with a human message). */
+function validateHttpProxy(proxy: NonNullable<HostPayload['httpProxy']>): void {
+  if (typeof proxy !== 'object') throw new Error('httpProxy must be an object or null')
+  if (proxy.host === undefined || proxy.host.trim() === '') throw new Error('httpProxy.host is required')
+  if (!isHeaderSafe(proxy.host)) throw new Error('httpProxy.host must not contain CR/LF')
+  if (!Number.isInteger(proxy.port) || proxy.port < 1 || proxy.port > 65535) {
+    throw new Error(`httpProxy.port must be an integer in [1, 65535], got ${JSON.stringify(proxy.port)}`)
+  }
+  if (proxy.username !== undefined && !isHeaderSafe(proxy.username)) throw new Error('httpProxy.username must not contain CR/LF')
+  if (proxy.password !== undefined && !isHeaderSafe(proxy.password)) throw new Error('httpProxy.password must not contain CR/LF')
+}
+
 /** Expand a leading ~ to the user home directory. */
 export function expandHome(path: string): string {
   if (path === '~') return homedir()
@@ -190,6 +207,9 @@ export class HostStore {
       auth: entry.auth.kind,
       keyReady: entry.auth.kind !== 'key' || existsSync(expandHome(entry.auth.keyPath ?? '')),
       proxyJump: [...entry.proxyJump],
+      httpProxy: entry.httpProxy === undefined
+        ? undefined
+        : { host: entry.httpProxy.host, port: entry.httpProxy.port, hasAuth: entry.httpProxy.password !== undefined && entry.httpProxy.password !== '' },
       description: entry.description,
       environment: entry.environment,
       tags: [...entry.tags],
@@ -230,6 +250,32 @@ export class HostStore {
     }
     if (entry.auth.kind === 'key' && !entry.auth.keyPath) {
       throw new Error('keyPath is required for key auth')
+    }
+    // httpProxy: omitted keeps the stored proxy, explicit null clears it.
+    // A provided object with an empty password inherits the stored one
+    // (write-only semantics, mirroring auth above) so the browser — which
+    // never sees proxy credentials — cannot accidentally strip them.
+    if (payload.httpProxy === undefined) {
+      entry.httpProxy = prev?.httpProxy
+    } else if (payload.httpProxy === null) {
+      entry.httpProxy = undefined
+    } else {
+      validateHttpProxy(payload.httpProxy)
+      const storedPassword = prev?.httpProxy?.password
+      const password = payload.httpProxy.password !== undefined && payload.httpProxy.password !== ''
+        ? payload.httpProxy.password
+        : storedPassword
+      // Omitted (or blank) username inherits the stored one, mirroring the
+      // password — partial updates from the redacted UI stay non-destructive.
+      const username = payload.httpProxy.username !== undefined && payload.httpProxy.username !== ''
+        ? payload.httpProxy.username
+        : prev?.httpProxy?.username
+      entry.httpProxy = {
+        host: payload.httpProxy.host.trim(),
+        port: payload.httpProxy.port,
+        ...(username !== undefined && username !== '' ? { username } : {}),
+        ...(password !== undefined ? { password } : {}),
+      }
     }
     this.entries.set(alias, entry)
     this.save()

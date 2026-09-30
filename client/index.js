@@ -27,8 +27,18 @@ window.__ModuleLoader__.load({
     const REMOTE_PACKAGE = 'dsh-remote-ide' // typert descriptor prefix — protocol constant, keep in sync with src/typert.ts
     const REMOTE_NAMESPACE = 'ssh-remote'
 
-    function passthroughSchema(typeSymbol) {
-      return { mode: 'strict', typeSymbol, schema: { parse: (value) => value } }
+    // 0.1.7 typert 客户端契约：
+    //  - 参数/uplink/context 必须是 strict codec（gateway requireStrictInputs）；
+    //    strict codec 需要 typeSymbol + create() 工厂（registry validateCodec），
+    //    typeSymbol 按 `<package>#<schemaName>` 解析到 contribution.schemas。
+    //  - 结果 codec 不作 strict 要求，src-json 即可（值原样回传）。
+    // 这里全部用透传 schema（~standard.validate 原样放行）：真实校验在 host
+    // 半的 service 里（与 host contribution 的 SRC_JSON 对齐）。
+    const PASSTHROUGH_SCHEMA = {
+      '~standard': { version: 1, vendor: 'schemastery', validate: (value) => ({ value }) },
+    }
+    function paramCodec(name) {
+      return { mode: 'strict', typeSymbol: REMOTE_PACKAGE + '#' + name, create: () => PASSTHROUGH_SCHEMA }
     }
     function desc(method, params, resultType) {
       return {
@@ -39,13 +49,15 @@ window.__ModuleLoader__.load({
         invocation: { kind: 'direct' },
         parameters: params.map((name) => ({
           name, wire: name, source: 'json',
-          codec: passthroughSchema(REMOTE_PACKAGE + '#' + name),
+          codec: paramCodec(name),
         })),
-        result: passthroughSchema(REMOTE_PACKAGE + '#' + resultType),
+        result: { mode: 'src-json' },
       }
     }
+    const PARAM_NAMES = ['id', 'patch', 'hostId', 'cfg', 'path', 'remotePath']
     const CLIENT_TYPERT_REMOTE = {
       package: REMOTE_PACKAGE,
+      schemas: PARAM_NAMES.map((name) => ({ name, create: () => PASSTHROUGH_SCHEMA })),
       descriptors: [
         desc('listHosts', [], 'ListHostsResult'),
         desc('saveHost', ['id', 'patch'], 'SaveHostResult'),
@@ -265,6 +277,7 @@ window.__ModuleLoader__.load({
     function HostForm({ initial, onCancel, onSave }) {
       const [form, setForm] = useState(initial || {
         name: '', host: '', port: '22', user: '', authType: 'key', privateKeyPath: '', password: '',
+        proxyEnabled: false, proxyHost: '', proxyPort: '8080', proxyUsername: '', proxyPassword: '',
       })
       const [error, setError] = useState(null)
       const [showPw, setShowPw] = useState(false)
@@ -277,6 +290,20 @@ window.__ModuleLoader__.load({
         if (form.authType === 'key' && !form.privateKeyPath.trim()) {
           setError('请填写私钥路径，或改用密码认证'); return
         }
+        let httpProxy
+        if (form.proxyEnabled) {
+          const proxyPort = Number.parseInt(form.proxyPort, 10)
+          if (!form.proxyHost.trim()) { setError('启用代理时代理地址必填'); return }
+          if (!Number.isInteger(proxyPort) || proxyPort < 1 || proxyPort > 65535) { setError('代理端口须为 1–65535'); return }
+          httpProxy = {
+            host: form.proxyHost.trim(),
+            port: proxyPort,
+            username: form.proxyUsername.trim() || undefined,
+            password: form.proxyPassword || undefined,
+          }
+        } else if (initial && initial.proxyEnabled) {
+          httpProxy = null // 取消勾选 = 显式清除已存代理
+        }
         onSave({
           name: form.name.trim() || undefined,
           host: form.host.trim(),
@@ -285,6 +312,7 @@ window.__ModuleLoader__.load({
           authType: form.authType,
           privateKeyPath: form.authType === 'key' ? form.privateKeyPath.trim() : undefined,
           password: form.authType === 'password' ? form.password : undefined,
+          httpProxy,
         })
       }
       // 小眼睛：显示/隐藏密码（纯 SVG，无 emoji）。
@@ -323,6 +351,16 @@ window.__ModuleLoader__.load({
         form.authType === 'key'
           ? field('私钥路径', h('input', { value: form.privateKeyPath, onChange: set('privateKeyPath'), placeholder: 'C:\\Users\\you\\.ssh\\id_ed25519 或 ~/.ssh/id_ed25519' }))
           : field('密码' + (initial ? '（留空保持已保存）' : ''), passwordInput),
+        h('label', { className: 'dri-field', style: { display: 'flex', alignItems: 'center', gap: '8px', flexDirection: 'row', cursor: 'pointer' } },
+          h('input', { type: 'checkbox', checked: form.proxyEnabled, onChange: (e) => setForm({ ...form, proxyEnabled: e.target.checked }) }),
+          h('span', null, '通过 HTTP 代理连接（CONNECT 隧道，适用于需经代理出网的目标）')),
+        form.proxyEnabled
+          ? h('div', { className: 'dri-grid2' },
+              field('代理地址 *', h('input', { value: form.proxyHost, onChange: set('proxyHost'), placeholder: 'proxy.example.com' })),
+              field('代理端口', h('input', { value: form.proxyPort, onChange: set('proxyPort'), placeholder: '8080' })),
+              field('代理用户名（可选）', h('input', { value: form.proxyUsername, onChange: set('proxyUsername'), placeholder: '留空 = 匿名代理' })),
+              field('代理密码' + (initial && initial.proxyEnabled ? '（留空保持已保存）' : '（可选）'), h('input', { type: 'password', value: form.proxyPassword, onChange: set('proxyPassword'), autoComplete: 'new-password', placeholder: '••••••••' })))
+          : null,
         h('div', { className: 'dri-formActions' },
           h('button', { className: 'dri-btn', onClick: onCancel }, '取消'),
           h('button', { className: 'dri-btn dri-btn-primary', onClick: submit }, '保存')))
@@ -367,6 +405,11 @@ window.__ModuleLoader__.load({
             name: editing.host.name || '', host: editing.host.host, port: String(editing.host.port),
             user: editing.host.user, authType: editing.host.authType || 'key',
             privateKeyPath: editing.host.privateKeyPath || '', password: '',
+            proxyEnabled: !!editing.host.httpProxy,
+            proxyHost: editing.host.httpProxy?.host || '',
+            proxyPort: editing.host.httpProxy ? String(editing.host.httpProxy.port || 8080) : '8080',
+            proxyUsername: editing.host.httpProxy?.username || '',
+            proxyPassword: '',
           } : null,
           onCancel: () => setEditing(null),
           onSave: async (patch) => {
@@ -764,10 +807,16 @@ window.__ModuleLoader__.load({
       }
 
       ctx.effect(async () => {
-        const disposer = await ctx.remote.$mount(CLIENT_TYPERT_REMOTE)
-        mounted = true
-        await refresh()
-        return disposer
+        try {
+          const disposer = await ctx.remote.$mount(CLIENT_TYPERT_REMOTE)
+          mounted = true
+          await refresh()
+          return disposer
+        } catch (error) {
+          // 挂载失败不再表现为「永远加载中」：把错误亮在区块顶上（0.1.7 真机排障）。
+          store.set({ status: 'error', error: '客户端远程挂载失败: ' + String((error && error.message) || error) })
+          throw error
+        }
       }, 'dsh-remote-ide: typert mount')
 
       const load = () => refresh()
@@ -811,27 +860,33 @@ window.__ModuleLoader__.load({
       // 工作区选择器：填充官方 ui-workspace 的两个 directory-flow 洞
       // （conversation hero + sidebar 的「添加工作区」入口只在洞被占用时
       // 出现；onPicked(路径) 交给官方 createWorkspace 收养）。
-      const workspaces = () => {
-        try { return ctx.get('workspaces') } catch { return undefined }
+      // 0.1.7 排障：选择器注册失败绝不拖垮设置卡——独立 try/catch + 显式
+      // console 留痕（F12 一眼可辨）。
+      try {
+        const workspaces = () => {
+          try { return ctx.get('workspaces') } catch { return undefined }
+        }
+        pickerDeps = {
+          load,
+          saveHost,
+          listRemoteDir,
+          mkdirRemote,
+          createPlaceholder,
+          pickDirectory: async () => {
+            const surface = workspaces()
+            if (!surface || typeof surface.pickDirectory !== 'function') return null
+            return surface.pickDirectory()
+          },
+        }
+        ctx.slots.inject('conversation.hero.workspace.directoryFlow', () =>
+          ctx.slots.inject('sidebar.workspaces.directoryFlow', function* () {
+            yield ctx.slots.register({ name: 'conversation.hero.workspace.directoryFlow', id: 'dsh-remote-ide', priority: -100 }, WorkspacePicker)
+            yield ctx.slots.register({ name: 'sidebar.workspaces.directoryFlow', id: 'dsh-remote-ide', priority: -100 }, WorkspacePicker)
+          }),
+        )
+      } catch (error) {
+        console.error('[dsh-remote-ide] workspace picker registration failed:', error)
       }
-      pickerDeps = {
-        load,
-        saveHost,
-        listRemoteDir,
-        mkdirRemote,
-        createPlaceholder,
-        pickDirectory: async () => {
-          const surface = workspaces()
-          if (!surface || typeof surface.pickDirectory !== 'function') return null
-          return surface.pickDirectory()
-        },
-      }
-      ctx.slots.inject('conversation.hero.workspace.directoryFlow', () =>
-        ctx.slots.inject('sidebar.workspaces.directoryFlow', function* () {
-          yield ctx.slots.register({ name: 'conversation.hero.workspace.directoryFlow', id: 'dsh-remote-ide', priority: -100 }, WorkspacePicker)
-          yield ctx.slots.register({ name: 'sidebar.workspaces.directoryFlow', id: 'dsh-remote-ide', priority: -100 }, WorkspacePicker)
-        }),
-      )
 
       // 本插件渲染错误的可观测性：带上前缀，浏览器 console 一眼可辨。
       ctx.effect(() => {

@@ -7,6 +7,31 @@
 /** Authentication flavors a host entry may carry. */
 export type SshAuthKind = 'key' | 'password'
 
+/**
+ * Optional HTTP CONNECT proxy for this entry's first TCP dial (the entry
+ * itself when no proxyJump is set, else its first jump hop). Credentials
+ * ride Basic auth on the CONNECT request; the target hostname is sent as
+ * CONNECT authority, so name resolution happens at the proxy.
+ */
+export interface HttpProxyConfig {
+  /** Proxy hostname or IP. */
+  host: string
+  /** Proxy port (1-65535). */
+  port: number
+  /** Basic-auth user; omit for an unauthenticated proxy. */
+  username?: string
+  /** Basic-auth password. Secret: never projected to the browser/agent. */
+  password?: string
+}
+
+/** Secret-free projection of an entry's httpProxy (safe for browser/agent). */
+export interface HttpProxySummary {
+  host: string
+  port: number
+  /** Whether credentials are configured (values never leave the store). */
+  hasAuth: boolean
+}
+
 /** One stored host entry (the ~/.dsh/dsh-remote-ide.json store shape). */
 export interface SshHostEntry {
   /** Stable, user-chosen identifier used by every operation. */
@@ -29,6 +54,8 @@ export interface SshHostEntry {
   }
   /** Jump chain: local aliases connected through in order (ProxyJump). */
   proxyJump: string[]
+  /** Optional HTTP CONNECT proxy for this chain's first dial. */
+  httpProxy?: HttpProxyConfig
   /** Free-form note. */
   description?: string
   /** Deployment environment label (development / production / ...). */
@@ -49,6 +76,8 @@ export interface SshHostSummary {
   /** Whether the key path exists on the host machine (key auth only). */
   keyReady: boolean
   proxyJump: string[]
+  /** Redacted proxy view (credentials never leave the store). */
+  httpProxy?: HttpProxySummary
   description?: string
   environment?: string
   tags: string[]
@@ -66,6 +95,10 @@ export interface HostPayload {
    *  stored secrets (the browser never receives them back). */
   auth?: SshHostEntry['auth']
   proxyJump?: string[]
+  /** Optional HTTP CONNECT proxy. Omitted keeps the stored one; `null`
+   *  clears it. A provided object with an empty password inherits the
+   *  stored password (write-only semantics, same as `auth`). */
+  httpProxy?: HttpProxyConfig | null
   description?: string
   environment?: string
   tags?: string[]
