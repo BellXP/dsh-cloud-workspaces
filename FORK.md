@@ -24,9 +24,12 @@ dsh plugin --profile web add link:C:\Users\x00968307\dsh-cloud-workspaces
 ## What this fork is
 
 Upstream: `dsh-cloud-workspaces` v0.3.0 (github.com/harryopo/dsh-cloud-workspaces, Apache-2.0),
-running against **dsh 0.1.7-rc.2**. The complete diff vs upstream is archived next to this
-file as `dsh-cloud-workspaces-0.1.7-fork.patch` (also applyable with `git apply` onto a fresh
-upstream clone). Summary of the changes:
+running against **dsh 0.2.0-rc.2** (also loads on 0.1.7-rc.2 — the peer ranges span both). 0.2.0
+added a plugin compatibility gate (`dsh-app-boot` checks every `@deepseek-ai/dsh*` peerDependency
+against the runtime with `semver.satisfies(..., {includePrerelease:true})`); this fork declares
+`>=0.1.1-rc.2 <0.3.0` on all eight peers, verified against the bundled semver 7.8.5. The complete
+diff vs upstream is archived next to this file as `dsh-cloud-workspaces-0.1.7-fork.patch` (also
+applyable with `git apply` onto a fresh upstream clone). Summary of the changes:
 
 1. **Host half, 0.1.7 settings-API migration** — upstream imports
    `installSettingsSection`/`settingsNamespace` from `@deepseek-ai/dsh-settings`, removed in
@@ -71,6 +74,16 @@ upstream clone). Summary of the changes:
    - Seams install via `ctx.inject` when the services appear, patch own-properties, and
      restore on unload. They follow the plugin's enabled switch. Both verified live against
      flex-1 (`test-seam-live.mjs`).
+7. **dsh 0.2.0-rc.2 compatibility** (2026-09-30) — the new peer gate skipped the whole bundle
+   until the peer ranges were widened (see above). A byte-diff of the 0.1.7-rc.2 vs 0.2.0-rc.2
+   package trees (old tarballs recovered from the local npm `_cacache`) proved every wrapped
+   surface is **byte-identical**: dsh-fs FileSystem + types, dsh-subprocess
+   SubprocessRuntime/spec/handle, workspace-files' ctx.fs call set and error mappings, the
+   terminal controller's spawnTerminal call and handle consumption, the typert codec validation
+   (strict `create()` + gateway `requireStrictInputs` + src-json results), the
+   `settings.section` / workspace-picker slots, and the `dsh.bundle.patch`/`dsh.client`
+   manifest loading. Upstream's only change is an internal shell-candidate dedup refactor that
+   does not touch the wrapped paths — no code changes were needed beyond the peer ranges.
 
 ## Rebuild (after editing src/ — client/index.js needs no build)
 

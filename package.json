@@ -1,6 +1,6 @@
 {
   "name": "dsh-cloud-workspaces",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Cloud workspaces for DeepSeek Harness: pick \"Cloud (SSH)\" in the workspace chooser and the agent's bash/read/write/edit/glob/grep tools transparently run on your Linux server over SSH. Includes ssh_* agent tools, an SSH host settings card, jump-host support and persistent connection pooling.",
   "type": "module",
   "engines": {
@@ -56,14 +56,14 @@
     "ssh2": "^1.16.0"
   },
   "peerDependencies": {
-    "@deepseek-ai/dsh-fs": "^0.1.1-rc.2",
-    "@deepseek-ai/dsh-jobs": "^0.1.1-rc.2",
-    "@deepseek-ai/dsh-settings": "^0.1.1-rc.2",
-    "@deepseek-ai/dsh-subprocess": "^0.1.1-rc.2",
-    "@deepseek-ai/dsh-system-prompt": "^0.1.1-rc.2",
-    "@deepseek-ai/dsh-tools": "^0.1.1-rc.2",
-    "@deepseek-ai/dsh-typert-protocol": "^0.1.1-rc.2",
-    "@deepseek-ai/dsh-workspace": "^0.1.1-rc.2"
+    "@deepseek-ai/dsh-fs": ">=0.1.1-rc.2 <0.3.0",
+    "@deepseek-ai/dsh-jobs": ">=0.1.1-rc.2 <0.3.0",
+    "@deepseek-ai/dsh-settings": ">=0.1.1-rc.2 <0.3.0",
+    "@deepseek-ai/dsh-subprocess": ">=0.1.1-rc.2 <0.3.0",
+    "@deepseek-ai/dsh-system-prompt": ">=0.1.1-rc.2 <0.3.0",
+    "@deepseek-ai/dsh-tools": ">=0.1.1-rc.2 <0.3.0",
+    "@deepseek-ai/dsh-typert-protocol": ">=0.1.1-rc.2 <0.3.0",
+    "@deepseek-ai/dsh-workspace": ">=0.1.1-rc.2 <0.3.0"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
