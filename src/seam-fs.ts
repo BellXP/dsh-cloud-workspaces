@@ -202,13 +202,18 @@ export function installRemoteFsSeam(ctx: Context, runtime: SshRuntime, enabled: 
       try {
         const sftp = await sftpFor(route.hostId)
         const stats = await sftpCall<SftpStats>(cb => sftp.lstat(route.remotePath, cb))
+        debugLog(`fs seam lstat: ${route.hostId}:${route.remotePath} ok`)
         return {
           version: versionOf(route.remotePath, stats),
           type: typeOf(stats, true) as FsPathInfo['type'],
           ...(stats.isFile() ? { size: stats.size } : {}),
         }
       } catch (error) {
-        if (isMissingPath(error)) return undefined
+        if (isMissingPath(error)) {
+          debugLog(`fs seam lstat: ${route.hostId}:${route.remotePath} MISSING (${error instanceof Error ? error.message : String(error)})`)
+          return undefined
+        }
+        debugLog(`fs seam lstat: ${route.hostId}:${route.remotePath} ERROR ${error instanceof Error ? error.message : String(error)}`)
         throw wrapError('lstat', p, error)
       }
     }
@@ -223,13 +228,18 @@ export function installRemoteFsSeam(ctx: Context, runtime: SshRuntime, enabled: 
       try {
         const sftp = await sftpFor(route.hostId)
         const stats = await sftpCall<SftpStats>(cb => sftp.stat(route.remotePath, cb))
+        debugLog(`fs seam stat: ${route.hostId}:${route.remotePath} ok`)
         return {
           version: versionOf(route.remotePath, stats),
           type: typeOf(stats) as FsInfo['type'],
           ...(stats.isFile() ? { size: stats.size } : {}),
         }
       } catch (error) {
-        if (isMissingPath(error)) return undefined
+        if (isMissingPath(error)) {
+          debugLog(`fs seam stat: ${route.hostId}:${route.remotePath} MISSING (${error instanceof Error ? error.message : String(error)})`)
+          return undefined
+        }
+        debugLog(`fs seam stat: ${route.hostId}:${route.remotePath} ERROR ${error instanceof Error ? error.message : String(error)}`)
         throw wrapError('stat', target.displayPath, error)
       }
     }
@@ -244,6 +254,7 @@ export function installRemoteFsSeam(ctx: Context, runtime: SshRuntime, enabled: 
       try {
         const sftp = await sftpFor(route.hostId)
         const listed = await sftpCall<Array<{ filename: string; attrs: SftpStats }>>(cb => sftp.readdir(route.remotePath, cb))
+        debugLog(`fs seam listDir: ${route.hostId}:${route.remotePath} ok (${listed.length} entries)`)
         const entries: FsDirEntry[] = []
         for (const entry of listed) {
           const childKey = path.join(route.key, entry.filename)
@@ -257,8 +268,10 @@ export function installRemoteFsSeam(ctx: Context, runtime: SshRuntime, enabled: 
         return entries.sort((left, right) => left.name.localeCompare(right.name))
       } catch (error) {
         if (isMissingPath(error)) {
+          debugLog(`fs seam listDir: ${route.hostId}:${route.remotePath} MISSING (${error instanceof Error ? error.message : String(error)})`)
           throw new FsError(`cannot list "${target.displayPath}": not found`, 'FS_NOT_FOUND')
         }
+        debugLog(`fs seam listDir: ${route.hostId}:${route.remotePath} ERROR ${error instanceof Error ? error.message : String(error)}`)
         throw wrapError('list', target.displayPath, error)
       }
     }
