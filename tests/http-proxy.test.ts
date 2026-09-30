@@ -5,9 +5,17 @@
 import { describe, expect, it } from 'vitest'
 import net from 'node:net'
 import http from 'node:http'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { connectHttpProxy } from '../src/engine'
 import { HostStore } from '../src/store'
 import type { SshHostEntry } from '../src/protocol'
+
+/** HostStore 是 JSON 文件存储：用临时目录真实文件（':memory:' 是 SQLite 习语，
+ *  且 Windows 文件名禁止冒号，会写成不存在的 ADS 路径）。 */
+function makeStore(): HostStore {
+  return new HostStore(join(tmpdir(), `dsh-hoststore-test-${process.pid}-${Date.now()}.json`))
+}
 
 function makeEntry(patch: Partial<SshHostEntry>): SshHostEntry {
   return {
@@ -81,27 +89,27 @@ describe('connectHttpProxy', () => {
 
 describe('HostStore httpProxy persistence', () => {
   it('keeps the stored password when an update omits it, clears on null', () => {
-    const store = new HostStore(':memory:')
+    const store = makeStore()
     store.upsert(makeEntry({}) as never, undefined)
     // Direct payload calls with a synthetic entry shape:
     store.upsert({
       alias: 'a', host: 'h', user: 'u',
-      auth: { kind: 'password', password: 'sshpw' },
+      auth: { kind: 'password', password: 'sshpw' }, proxyJump: [],
       httpProxy: { host: 'proxy', port: 8080, username: 'pu', password: 'pp' },
     })
     expect(store.get('a')?.httpProxy).toEqual({ host: 'proxy', port: 8080, username: 'pu', password: 'pp' })
     // Omitted password inherits; omitted object keeps whole proxy.
-    store.upsert({ alias: 'a', host: 'h', user: 'u', auth: { kind: 'password', password: 'sshpw' }, httpProxy: { host: 'proxy2', port: 3128 } })
+    store.upsert({ alias: 'a', host: 'h', user: 'u', auth: { kind: 'password', password: 'sshpw' }, proxyJump: [], httpProxy: { host: 'proxy2', port: 3128 } })
     expect(store.get('a')?.httpProxy).toEqual({ host: 'proxy2', port: 3128, username: 'pu', password: 'pp' })
-    store.upsert({ alias: 'a', host: 'h', user: 'u', auth: { kind: 'password', password: 'sshpw' }, httpProxy: { host: 'proxy3', port: 1 } })
+    store.upsert({ alias: 'a', host: 'h', user: 'u', auth: { kind: 'password', password: 'sshpw' }, proxyJump: [], httpProxy: { host: 'proxy3', port: 1 } })
     expect(store.get('a')?.httpProxy).toEqual({ host: 'proxy3', port: 1, username: 'pu', password: 'pp' })
     // null clears.
-    store.upsert({ alias: 'a', host: 'h', user: 'u', auth: { kind: 'password', password: 'sshpw' }, httpProxy: null })
+    store.upsert({ alias: 'a', host: 'h', user: 'u', auth: { kind: 'password', password: 'sshpw' }, proxyJump: [], httpProxy: null })
     expect(store.get('a')?.httpProxy).toBeUndefined()
     // Summary never leaks the password.
     const summary = store.summarize(store.get('a')!)
     expect(summary.httpProxy).toBeUndefined()
-    store.upsert({ alias: 'a', host: 'h', user: 'u', auth: { kind: 'password', password: 'sshpw' }, httpProxy: { host: 'p', port: 2, username: 'u1', password: 's3' } })
+    store.upsert({ alias: 'a', host: 'h', user: 'u', auth: { kind: 'password', password: 'sshpw' }, proxyJump: [], httpProxy: { host: 'p', port: 2, username: 'u1', password: 's3' } })
     expect(store.summarize(store.get('a')!).httpProxy).toEqual({ host: 'p', port: 2, hasAuth: true })
   })
 

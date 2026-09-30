@@ -157,6 +157,17 @@ export function buildSessionTools(runtime: SshRuntime, route: SessionRoute, jobs
   /** 会话级常驻 shell（B 方案）：首条前台 bash 时惰性打开，cd/环境跨命令持久。 */
   let shell: PersistentShellSession | undefined
 
+  /**
+   * 在会话常驻 shell 上跑只读探查命令（grep/glob 与 bash 共享同一条通道，
+   * 省掉每次一次性 exec 的 ~300ms 建连开销）。命令一律用绝对路径、不传
+   * cwd——不扰动 shell 的持久目录；超时与降级语义沿用 PersistentShell
+   * （超时杀通道下次重建，传输错误降级一次性 exec）。
+   */
+  const probeOnSessionShell = async (command: string, timeoutMs: number): Promise<ExecResult> => {
+    shell ??= await engine.openShellSession(route.hostId, { initialCwd: route.remoteCwd })
+    return shell.run(command, { timeoutMs })
+  }
+
   const bashTool = defineTool({
     name: 'bash',
     description: 'Run a bash command on the remote server (this session\'s workspace host) and return stdout/stderr/exit code. Commands run on ONE persistent shell — cwd changes, exports and activated environments persist between calls unless workdir is given (workdir forces a cd). For long-running commands (installs, builds, test suites) pass run_in_background:true — no timeout applies; poll with job_output / job_list, stop with job_kill.',
@@ -358,7 +369,7 @@ export function buildSessionTools(runtime: SshRuntime, route: SessionRoute, jobs
     },
     async execute(args: { pattern: string; path?: string }) {
       const base = resolveInSession(route, args.path ?? '.')
-      const result = await engine.exec(route.hostId, `find ${quoteSh(base)} -type f -print 2>/dev/null | head -n 20000`, { timeoutMs: 30_000 })
+      const result = await probeOnSessionShell(`find ${quoteSh(base)} -type f -print 2>/dev/null | head -n 20000`, 30_000)
       const regexp = globToRegExp(args.pattern)
       const prefix = base === '/' ? '' : base + '/'
       const matches: string[] = []
@@ -400,7 +411,7 @@ export function buildSessionTools(runtime: SshRuntime, route: SessionRoute, jobs
       const base = resolveInSession(route, args.path ?? '.')
       const includeArg = args.include !== undefined && args.include !== '' ? ` --include=${quoteSh(args.include)}` : ''
       const command = `grep -rInE ${includeArg} -e ${quoteSh(args.pattern)} ${quoteSh(base)} 2>/dev/null | head -n 500`
-      const result = await engine.exec(route.hostId, command, { timeoutMs: 30_000 })
+      const result = await probeOnSessionShell(command, 30_000)
       const lines = result.stdout.split('\n').filter((line) => line !== '')
       const truncated = lines.length >= 500
       return jsonSafe({ pattern: args.pattern, path: base, matches: lines, truncated })

@@ -41,6 +41,12 @@ import { resolveRemotePath, routeByCwd } from './workspace'
 const BINARY_SAMPLE_BYTES = 8192
 /** base64 严格校验（realpath 传输用 -w0 无换行）。 */
 const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/
+/** 只读 stat 微缓存 TTL（毫秒）：version 是新鲜度令牌，短陈旧只影响显示。 */
+const STAT_CACHE_TTL_MS = 2500
+/** 伪 watch 轮询间隔（毫秒）：SFTP 无 inotify，mtime/attrs 指纹扫描（文件 1 RTT stat、目录 1 RTT readdir）。 */
+const WATCH_POLL_MS = 3000
+/** 伪 watch 连续失败上报阈值（约 15s 瞬态容错；中止不计入）。 */
+const WATCH_FAILURE_LIMIT = 5
 
 /** 中止预检：signal 已中止则抛 FS_ABORTED。 */
 function assertNotAborted(signal: AbortSignal | undefined, operation: string): void {
@@ -218,6 +224,14 @@ export class SshFileSystem extends FileSystem {
   private readonly locks = new Map<string, Promise<unknown>>()
 
   /**
+   * 只读 stat 微缓存：workspace-files 每次侧栏打开/预览串 resolve→lstat→
+   * stat→read，重复的 stat 各花 1 RTT 的 SFTP 往返。version 本身就是新鲜度
+   * 令牌，短 TTL 内的陈旧只影响显示精度。写路径（writeText/editText 的
+   * 存在性与版本守卫）仍走 probe（权威、不缓存），并在落盘后失效缓存。
+   */
+  private readonly statCache = new Map<string, { expires: number; info: FsInfo | undefined }>()
+
+  /**
    * 会话锚定的主机（占位工作区路由）。第一个带占位 cwd 的 resolve/lstat
    * 把整个 fs 实例锚到该主机——isolate realm 下每会话一个实例，此后所有
    * 操作（含 readText/writeText 等只拿 FsTarget 的方法）都落在该主机上。
@@ -305,6 +319,20 @@ export class SshFileSystem extends FileSystem {
   // ------------------------------------------------------------ metadata
 
   override async stat(target: FsTarget, signal?: AbortSignal): Promise<FsInfo | undefined> {
+    const key = String(target.targetKey)
+    const cached = this.statCache.get(key)
+    if (cached !== undefined && cached.expires > Date.now()) return cached.info
+    const info = await this.statUncached(target, signal)
+    // 上界保护：超 256 条先清一次过期项（会话实例内条目本就有限）。
+    if (this.statCache.size >= 256) {
+      const now = Date.now()
+      for (const [k, v] of this.statCache) if (v.expires <= now) this.statCache.delete(k)
+    }
+    this.statCache.set(key, { expires: Date.now() + STAT_CACHE_TTL_MS, info })
+    return info
+  }
+
+  private async statUncached(target: FsTarget, signal?: AbortSignal): Promise<FsInfo | undefined> {
     const entry = await this.probe(String(target.targetKey), target.displayPath, signal)
     if (entry === undefined) return undefined
     return {
@@ -452,6 +480,76 @@ export class SshFileSystem extends FileSystem {
     }
   }
 
+  // ---------------------------------------------------------------- watch
+
+  /**
+   * 伪 watch：SFTP 没有 inotify，用 mtime/attrs 指纹轮询实现 content-free
+   * 失效通知（文件 = 1 RTT stat 的 mtime+size；目录 = 1 RTT readdir 的
+   * filename+mtime+size 拼接）。ENOENT 也是指纹（观察创建/删除）；中止与
+   * 瞬态错误不计失败，连续 WATCH_FAILURE_LIMIT 次才 changed(error) 上报并
+   * 自停（订阅方会回退到今天的 watch-unsupported 行为）。
+   */
+  // NOTE: 不加 override —— 本仓库 devDeps 的 dsh-fs 0.1.1 类型未声明 watch
+  // （0.2.0 运行时的基类才有）；此处作为新方法声明，运行时遮蔽 0.2.0 基类
+  // 的默认拒绝实现。
+  async watch(
+    target: FsTarget,
+    changed: (error?: Error) => void,
+    signal: AbortSignal,
+  ): Promise<() => Promise<void>> {
+    signal.throwIfAborted()
+    const key = String(target.targetKey)
+    let timer: ReturnType<typeof setInterval> | undefined
+    let stopped = false
+    let baseline: string | undefined
+    let failures = 0
+
+    const stop = (): void => {
+      if (stopped) return
+      stopped = true
+      if (timer !== undefined) clearInterval(timer)
+    }
+
+    const fingerprint = async (): Promise<string> => {
+      const entry = await this.probe(key, target.displayPath, signal)
+      if (entry === undefined) return 'absent'
+      if (!entry.isDirectory()) return `f:${String(entry.mtime)}:${String(entry.size)}`
+      const sftp = await (await this.connectionFor()).getSftp()
+      const listed = await sftpCall<import('ssh2').FileEntryWithStats[]>((cb) => sftp.readdir(key, cb))
+      return `d:${listed
+        .map(entry => `${entry.filename}:${String(entry.attrs.mtime)}:${String(entry.attrs.size)}`)
+        .sort()
+        .join('|')}`
+    }
+
+    const poll = async (): Promise<void> => {
+      if (stopped || signal.aborted) return
+      try {
+        const next = await fingerprint()
+        failures = 0
+        if (baseline !== undefined && next !== baseline) changed()
+        baseline = next
+      } catch (error: unknown) {
+        if (signal.aborted || stopped) return
+        failures += 1
+        if (failures >= WATCH_FAILURE_LIMIT) {
+          stop()
+          changed(error instanceof Error ? error : new Error(String(error)))
+        }
+      }
+    }
+
+    // 初始化即观察就绪（契约：resolve 后 closeFn 才交还）。
+    baseline = await fingerprint()
+    if (signal.aborted) {
+      stop()
+      return async () => { stop() }
+    }
+    timer = setInterval(() => { void poll() }, WATCH_POLL_MS)
+    timer.unref?.()
+    return async () => { stop() }
+  }
+
   // ---------------------------------------------------------------- write
 
   override async writeText(
@@ -475,6 +573,7 @@ export class SshFileSystem extends FileSystem {
         expected?.kind === 'createIfAbsent',
         signal,
       )
+      this.statCache.delete(String(target.targetKey))
       return {
         operation: existing === undefined ? 'create' : 'update',
         version,
@@ -507,6 +606,7 @@ export class SshFileSystem extends FileSystem {
       const after = literalEdit(before, edit, target.displayPath)
       const storage = restoreLineEndings(after, detectsCrlf(raw))
       const version = await this.writeAtomic(target, storage, existing, false, signal)
+      this.statCache.delete(String(target.targetKey))
       return { version, before, after }
     })
   }

@@ -64,13 +64,15 @@ describe('SshRemoteService 端点结果 JSON-safe', () => {
     list?: () => Array<{ alias: string; auth: string }>
   }
 
-  /** 新世界语义：settings 文档不含口令；口令权威存储 = 0600 store（getStoredEntry）。 */
-  function setup(engineStub: EngineStub = {}, settingsHosts?: Record<string, SshHostConfig>) {
+  /** 0.1.7+ 语义：settings 镜像已退役，主机清单/口令权威存储 = 0600 store。 */
+  function setup(engineStub: EngineStub = {}) {
     const ctx = new Context()
     const upsertHost = engineStub.upsertHost ?? vi.fn(() => undefined)
     const runtimeStub = {
       getStoredEntry: engineStub.getStoredEntry
-        ?? ((alias: string) => alias === 'vm' ? { auth: { kind: 'password', password: 'secret' } } : undefined),
+        ?? ((alias: string) => alias === 'vm'
+          ? { auth: { kind: 'password', password: 'secret' }, proxyJump: [] }
+          : undefined),
       engine: {
         upsertHost,
         removeHost: engineStub.removeHost ?? (() => true),
@@ -79,15 +81,7 @@ describe('SshRemoteService 端点结果 JSON-safe', () => {
       },
     }
     const service = new SshRemoteService(ctx, runtimeStub as never)
-    const update = vi.fn((doc: { hosts: Record<string, SshHostConfig> }) => {
-      Object.assign(hosts, doc.hosts)
-      return Promise.resolve()
-    })
-    const hosts: Record<string, SshHostConfig> = settingsHosts ?? {
-      vm: { id: 'vm', host: '192.0.2.1', port: 22, user: 'root', authType: 'password' },
-    }
-    service.setSettings({ get: () => ({ hosts }), update } as never)
-    return { service, upsertHost, update, hosts }
+    return { service, upsertHost }
   }
 
   it('testConnection 成功：结果无 error own-key，整体 JSON-safe', async () => {
@@ -115,16 +109,12 @@ describe('SshRemoteService 端点结果 JSON-safe', () => {
     assertJsonSafe(result)
   })
 
-  it('saveHost：口令只进 store，settings 文档不含口令（明文落盘收敛回归）', async () => {
+  it('saveHost：口令只进 store（settings 镜像已退役，无第二落盘面）', async () => {
     const upsertHost = vi.fn(() => undefined)
-    const { service, update } = setup({ upsertHost })
+    const { service } = setup({ upsertHost })
     await service.saveHost('vm', { host: '192.0.2.1', user: 'root', authType: 'password', password: 'newpw' })
-    // 口令进 store
     const payload = upsertHost.mock.calls[0]?.[0] as { auth: { kind: string; password?: string } }
     expect(payload.auth).toEqual({ kind: 'password', password: 'newpw' })
-    // settings 文档不含 password
-    const written = update.mock.calls[0]?.[0].hosts.vm as Record<string, unknown>
-    expect(Object.hasOwn(written, 'password')).toBe(false)
   })
 
   it('saveHost：口令留空 = 沿用 store 既有口令', async () => {
@@ -135,19 +125,6 @@ describe('SshRemoteService 端点结果 JSON-safe', () => {
     expect(payload.auth.password).toBe('secret')
   })
 
-  it('迁移：settings 既有明文口令迁入 store 并从文档剥离', async () => {
-    const upsertHost = vi.fn(() => undefined)
-    const legacy: Record<string, SshHostConfig> = {
-      old: { id: 'old', host: '192.0.2.9', port: 22, user: 'root', authType: 'password', password: 'legacy-pw' },
-    }
-    const { update, hosts } = setup({ upsertHost }, legacy)
-    // setSettings 已异步触发迁移；等微任务落地
-    await new Promise((resolve) => setTimeout(resolve, 0))
-    const payload = upsertHost.mock.calls.find((call) => (call[0] as { alias?: string }).alias === 'old')?.[0] as {
-      auth: { kind: string; password?: string }
-    }
-    expect(payload?.auth).toEqual({ kind: 'password', password: 'legacy-pw' })
-    expect(Object.hasOwn(hosts.old, 'password')).toBe(false)
-    expect(update).toHaveBeenCalled()
-  })
+  // 迁移用例已随 settings 镜像退役移除：0.1.7 起 store 是唯一权威，
+  // settings→store 的一次性迁移由启动路径负责，不在 SshRemoteService 面。
 })

@@ -30,13 +30,18 @@ function route() {
   return { hostId: 'dev', remoteCwd: REMOTE_CWD, placeholderCwd: PLACEHOLDER }
 }
 
+/** 常驻 shell 桩：bash/glob/grep 前台命令都走 engine.openShellSession().run。 */
+function shellOverride(run: ReturnType<typeof vi.fn>) {
+  return { openShellSession: async () => ({ run }) }
+}
+
 describe('buildSessionTools', () => {
-  it('bash：相对 workdir 解析到远程工作区，输出 lossless', async () => {
-    const exec = vi.fn(async () => ({ success: true, exitCode: 0, timedOut: false, stdout: 'ok', stderr: '', durationMs: 4 }))
-    const tools = buildSessionTools(stubRuntime({ exec }), route())
+  it('bash：相对 workdir 解析到远程工作区（常驻 shell，显式 cwd 才传），输出 lossless', async () => {
+    const run = vi.fn(async () => ({ success: true, exitCode: 0, timedOut: false, stdout: 'ok', stderr: '', durationMs: 4 }))
+    const tools = buildSessionTools(stubRuntime(shellOverride(run)), route())
     const bash = tools.find((t) => t.name === 'bash')!
     const output = await bash.execute({ command: 'pwd', description: 'print cwd', workdir: 'sub' })
-    expect(exec).toHaveBeenCalledWith('dev', 'pwd', { cwd: REMOTE_CWD + '/sub', timeoutMs: undefined })
+    expect(run).toHaveBeenCalledWith('pwd', { cwd: REMOTE_CWD + '/sub' })
     expect(output.success).toBe(true)
     expect(output.kind).toBe('foreground')
     expect(Object.hasOwn(output, 'exitCode')).toBe(true)
@@ -94,28 +99,30 @@ describe('buildSessionTools', () => {
     expect(written).toBe('a Y b Y c\n')
   })
 
-  it('glob：无 "/" 的 pattern 按任意深度 basename 匹配', async () => {
-    const exec = vi.fn(async () => ({
+  it('glob：无 "/" 的 pattern 按任意深度 basename 匹配（常驻 shell 探查）', async () => {
+    const run = vi.fn(async () => ({
       success: true, exitCode: 0, timedOut: false,
       stdout: [REMOTE_CWD + '/a.ts', REMOTE_CWD + '/sub/b.ts', REMOTE_CWD + '/readme.md', REMOTE_CWD + '/c.tsx'].join('\n'),
       stderr: '', durationMs: 5,
     }))
-    const tools = buildSessionTools(stubRuntime({ exec }), route())
+    const tools = buildSessionTools(stubRuntime(shellOverride(run)), route())
     const glob = tools.find((t) => t.name === 'glob')!
     const output = await glob.execute({ pattern: '*.ts' })
+    expect(String(run.mock.calls[0]?.[0])).toContain(REMOTE_CWD)
+    expect(run.mock.calls[0]?.[1]).toEqual({ timeoutMs: 30_000 })
     expect(output.matches).toEqual([REMOTE_CWD + '/a.ts', REMOTE_CWD + '/sub/b.ts'])
     expect(output.truncated).toBe(false)
   })
 
-  it('grep：include 过滤进命令，pattern 经单引号转义', async () => {
-    const exec = vi.fn(async () => ({ success: true, exitCode: 0, timedOut: false, stdout: '', stderr: '', durationMs: 2 }))
-    const tools = buildSessionTools(stubRuntime({ exec }), route())
+  it('grep：include 过滤进命令，pattern 经单引号转义（常驻 shell 探查）', async () => {
+    const run = vi.fn(async () => ({ success: true, exitCode: 0, timedOut: false, stdout: '', stderr: '', durationMs: 2 }))
+    const tools = buildSessionTools(stubRuntime(shellOverride(run)), route())
     const grep = tools.find((t) => t.name === 'grep')!
     await grep.execute({ pattern: "it's", path: '.', include: '*.ts' })
-    const [alias, command] = exec.mock.calls[0] as [string, string]
-    expect(alias).toBe('dev')
+    const command = String(run.mock.calls[0]?.[0])
     expect(command).toContain("--include='*.ts'")
     expect(command).toContain("-e 'it'\\''s'")
+    expect(run.mock.calls[0]?.[1]).toEqual({ timeoutMs: 30_000 })
   })
 
   it('read_image：PNG 魔数识别 + base64 输出；非图片拒绝', async () => {

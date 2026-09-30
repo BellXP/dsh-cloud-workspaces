@@ -93,6 +93,28 @@ applyable with `git apply` onto a fresh upstream clone). Summary of the changes:
    (KILL signal + destroy; the next call rebuilds), transport errors fall back to one-shot exec
    so a command is never lost, and idle channels self-close after the engine's idle timeout.
    `engine.openShellSession()` in `src/engine.ts`; verified live by `test-persistent-live.mjs`.
+9. **Perf: shared-shell search + fs stat cache + pseudo-watch** (2026-10-01) — three follow-ups on the
+    persistent shell and the fs seam, from the post-0.2.0 backlog:
+    - `grep`/`glob` shadow tools now probe on the session's persistent shell (same channel as `bash`,
+      absolute paths, no cwd churn) instead of a fresh one-shot exec per call — saves the ~300 ms
+      channel setup on every search; the 30 s timeout and one-shot-exec fallback semantics carry over.
+    - fs seam read-side **stat micro-cache** (2.5 s TTL per targetKey): the sidebar's
+      resolve→lstat→stat→read chain no longer pays a duplicate SFTP RTT per stat. Write guards still
+      go through the authoritative uncached `probe`, and writes invalidate the entry on commit.
+    - fs seam **pseudo-watch**: SFTP has no inotify, so `watch()` now polls an mtime/attrs
+      fingerprint (file = 1 RTT stat, directory = 1 RTT readdir) every 3 s and issues the
+      content-free `changed()` invalidation — the sidebar file tree auto-follows agent edits
+      instead of requiring manual refresh. Transient errors are tolerated (5 consecutive failures
+      ≈ 15 s before the feed gives up and falls back to watch-unsupported behavior); ENOENT is a
+      fingerprint change, so create/delete events fire too. Declared without `override` because
+      the repo's 0.1.1-rc.2 devDeps typing has no `watch` on `FileSystem` (the 0.2.0 runtime base
+      class does; the method shadows it).
+    - Deferred: remote-aware terminal shell tab labels (`terminalEnvironment`/`resolveExecutable`
+      carry no cwd, so global seam routing can't attribute them to a session; needs an agent-scope
+      patch — see seam-terminal notes).
+    - Tests repaired to 124/124: the three session-tool cases were re-based on the persistent-shell
+      surface; the stale `setSettings`/`:memory:` fixtures in typert/http-proxy tests (broken since
+      the settings-mirror retirement and illegal `:` in Windows filenames respectively) were fixed.
 
 ## Rebuild (after editing src/ — client/index.js needs no build)
 
