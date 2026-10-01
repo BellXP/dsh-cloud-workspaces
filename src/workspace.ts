@@ -134,7 +134,11 @@ export function resolveRemotePath(requestedPath: string, remoteCwd: string, plac
   if (!posix.isAbsolute(requestedPath)) {
     if (placeholderCwd !== undefined) {
       const rel = path.relative(placeholderCwd, requestedPath)
-      if (rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel)) {
+      // rel === ''：请求的就是占位工作区根本身 → 远端根。（侧边栏树根查询
+      // 从上线第一天起就栽在这里：'' 被排除后落入 posix.resolve，把整个
+      // Windows 占位路径拼接到了远端根之后，SFTP 只能报 No such file。）
+      if (rel === '') return remoteCwd
+      if (!rel.startsWith('..') && !path.isAbsolute(rel)) {
         return posix.join(remoteCwd, rel.split(path.sep).join('/'))
       }
     }

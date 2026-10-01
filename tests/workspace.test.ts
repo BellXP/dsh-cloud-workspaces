@@ -104,6 +104,15 @@ describe('resolveRemotePath', () => {
     expect(resolveRemotePath(inside, remoteCwd, placeholderCwd)).toBe('/srv/app/sub/file.txt')
   })
 
+  it('maps the placeholder root itself to the remote cwd (sidebar tree root regression)', () => {
+    // 侧边栏以「占位根本身」请求（含正斜杠形式）：必须得到远端根，
+    // 而不是把整个 Windows 路径拼接到远端根之后（v0.5.1 前的线上 bug：
+    // SFTP 探测 /srv/app/C:/Users/... → No such file → 树空 + “目录不在了”）。
+    expect(resolveRemotePath(placeholderCwd, remoteCwd, placeholderCwd)).toBe('/srv/app')
+    const forwardSlashes = placeholderCwd.replaceAll('\\', '/')
+    expect(resolveRemotePath(forwardSlashes, remoteCwd, placeholderCwd)).toBe('/srv/app')
+  })
+
   it('normalizes plain remote absolute paths', () => {
     expect(resolveRemotePath('/data/x/../y//z', remoteCwd, placeholderCwd)).toBe('/data/y/z')
   })
