@@ -113,6 +113,14 @@ describe('resolveRemotePath', () => {
     expect(resolveRemotePath(forwardSlashes, remoteCwd, placeholderCwd)).toBe('/srv/app')
   })
 
+  it('maps a POSIX-form placeholder root to the remote cwd (POSIX-local regression, flex-1)', () => {
+    // POSIX 本机上占位路径天然是 posix 绝对形态——必须同样映射回远端根
+    // （2026-10-01 Linux 真机抓到的回归：posix.relative 根查询被当远端路径）。
+    const posixRoot = mapRemoteToLocal('h', remoteCwd, { DSH_REMOTE_ROOT: '/test-root/remote' })!.replaceAll('\\', '/')
+    expect(resolveRemotePath(posixRoot, remoteCwd, posixRoot)).toBe('/srv/app')
+    expect(resolveRemotePath(posixRoot + '/sub', remoteCwd, posixRoot)).toBe('/srv/app/sub')
+  })
+
   it('normalizes plain remote absolute paths', () => {
     expect(resolveRemotePath('/data/x/../y//z', remoteCwd, placeholderCwd)).toBe('/data/y/z')
   })

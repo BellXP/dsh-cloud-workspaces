@@ -146,7 +146,12 @@ export function resolveRemotePath(requestedPath: string, remoteCwd: string, plac
   }
   if (placeholderCwd !== undefined) {
     const rel = posix.relative(placeholderCwd, requestedPath)
-    if (rel !== '' && !rel.startsWith('..') && !posix.isAbsolute(rel)) {
+    // rel === ''：请求的就是占位工作区根本身 → 远端根。v0.5.1 修过 Windows
+    // 形态（非 posix 绝对 → 第一分支）；POSIX 本机上占位路径天然 posix 绝对，
+    // 落到这里——同样必须映射回远端根，否则整条占位路径被当远端路径（Linux
+    // 真机 flex-1 实测抓到，2026-10-01）。
+    if (rel === '') return remoteCwd
+    if (!rel.startsWith('..') && !posix.isAbsolute(rel)) {
       return posix.join(remoteCwd, rel)
     }
   }
