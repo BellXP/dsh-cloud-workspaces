@@ -99,6 +99,92 @@ describe('buildSessionTools', () => {
     expect(written).toBe('a Y b Y c\n')
   })
 
+  it('edit diff 呈现：presentCall 参数卡 + presentationMeta hunk（含上下文）+ presentResult meta/回退', async () => {
+    const tools = buildSessionTools(stubRuntime({
+      readFile: async () => ({ content: 'l1\nl2\nl3\nl4\nl5\nl6\nl7\n', truncated: false, size: 28, mtimeMs: 1 }),
+      writeFile: async () => ({ size: 9, mtimeMs: 3 }),
+    }), route())
+    const edit = tools.find((t) => t.name === 'edit')! as unknown as {
+      presentCall: (a: never) => { card: string; diffs: Array<{ path: string; oldText: string | null; newText: string }> }
+      presentResult: (a: never, r: unknown) => { card: string; diffs: Array<{ path: string; oldText: string | null; newText: string }> } | undefined
+      output: { presentationMeta: (a: never, v: unknown) => { diffs: unknown } }
+      execute: (a: never) => Promise<{ replacements: number; before: string; after: string }>
+    }
+    const args = { file_path: 'f.txt', old_string: 'l4', new_string: 'L4\nL4b' } as never
+    const call = edit.presentCall(args)
+    expect(call.card).toBe('diff')
+    expect(call.diffs[0]?.oldText).toBe('l4')
+    expect(call.diffs[0]?.newText).toBe('L4\nL4b')
+
+    const value = await edit.execute(args)
+    expect(value.replacements).toBe(1)
+    const meta = edit.output.presentationMeta(args, value)
+    const hunks = meta.diffs as Array<{ oldText: string | null; newText: string }>
+    expect(hunks.length).toBe(1)
+    expect(hunks[0]?.newText).toContain('L4b')
+    // 上下文 3：hunk 带出前后各 3 行
+    expect(hunks[0]?.oldText).toContain('l1')
+    expect(hunks[0]?.oldText).toContain('l7')
+
+    const viaMeta = edit.presentResult(args, { content: [], isError: false, meta })
+    expect(viaMeta?.card).toBe('diff')
+    expect(viaMeta?.diffs[0]?.newText).toContain('L4b')
+    // meta 缺失（旧会话回放）→ 回退调用参数 diff，而不是顶掉成原始文本
+    const fallback = edit.presentResult(args, { content: [], isError: false })
+    expect(fallback?.card).toBe('diff')
+    expect(fallback?.diffs[0]?.oldText).toBe('l4')
+    // 出错结果不呈现
+    expect(edit.presentResult(args, { content: [], isError: true, meta })).toBeUndefined()
+  })
+
+  it('edit：CRLF 文件匹配/写回保持原行尾，diff 基准做 LF 规范化', async () => {
+    const writeFile = vi.fn(async () => ({ size: 1, mtimeMs: 1 }))
+    const tools = buildSessionTools(stubRuntime({
+      readFile: async () => ({ content: 'a\r\nX\r\nb\r\n', truncated: false, size: 9, mtimeMs: 1 }),
+      writeFile,
+    }), route())
+    const edit = tools.find((t) => t.name === 'edit')! as unknown as {
+      execute: (a: never) => Promise<{ before: string; after: string }>
+    }
+    const value = await edit.execute({ file_path: 'c.txt', old_string: 'X', new_string: 'Y' } as never)
+    expect(writeFile.mock.calls[0]?.[2]).toBe('a\r\nY\r\nb\r\n') // 写回保持 CRLF
+    expect(value.before).toBe('a\nX\nb\n') // diff 基准 LF
+  })
+
+  it('write 呈现：create（读不到 before）→ 参数 diff 回退；update → hunk meta', async () => {
+    const makeWrite = (readFile: unknown) => {
+      const tools = buildSessionTools(stubRuntime({ readFile, writeFile: async () => ({ size: 1, mtimeMs: 1 }) }), route())
+      return tools.find((t) => t.name === 'write')! as unknown as {
+        presentCall: (a: never) => { card: string; diffs: Array<{ oldText: string | null; newText: string }> }
+        presentResult: (a: never, r: unknown) => { card: string; diffs: Array<{ oldText: string | null; newText: string }> } | undefined
+        output: { presentationMeta: (a: never, v: unknown) => { operation: string; diffs: unknown } }
+        execute: (a: never) => Promise<{ operation: string; before: string | null; after: string }>
+      }
+    }
+    const args = { file_path: 'n.txt', content: 'hello\nworld\n' } as never
+
+    const create = makeWrite(async () => { throw new Error('No such file') })
+    const call = create.presentCall(args)
+    expect(call.card).toBe('diff')
+    expect(call.diffs[0]?.oldText).toBeNull()
+    const created = await create.execute(args)
+    expect(created.operation).toBe('create')
+    expect(created.before).toBeNull()
+    const createMeta = create.output.presentationMeta(args, created)
+    expect(createMeta.operation).toBe('create')
+    expect(createMeta.diffs).toEqual([])
+    const createView = create.presentResult(args, { content: [], isError: false, meta: createMeta })
+    expect(createView?.diffs[0]?.oldText).toBeNull() // 空 diffs → 回退参数 diff（官方同款）
+
+    const update = makeWrite(async () => ({ content: 'hello\nold\n', truncated: false, size: 10, mtimeMs: 1 }))
+    const updated = await update.execute(args)
+    expect(updated.operation).toBe('update')
+    const updateMeta = update.output.presentationMeta(args, updated)
+    const hunks = updateMeta.diffs as Array<{ oldText: string | null; newText: string }>
+    expect(hunks[0]?.oldText).toContain('old')
+    expect(hunks[0]?.newText).toContain('world')
+  })
+
   it('glob：无 "/" 的 pattern 按任意深度 basename 匹配（常驻 shell 探查）', async () => {
     const run = vi.fn(async () => ({
       success: true, exitCode: 0, timedOut: false,

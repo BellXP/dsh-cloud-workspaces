@@ -144,6 +144,27 @@ applyable with `git apply` onto a fresh upstream clone). Summary of the changes:
     - Tests: 138/138 (13 new in `tests/seam-fs.test.ts`: cache hit/TTL/op-split/negative-cache/
       passthrough/read-chain sharing; watch change/close/absent→present/dir-content/failure-limit/
       local-unsupported; teardown restores prototype). tsc + tsdown + `test-built-lib.mjs` green.
+11. **Feature: rich diff presentation for remote edit/write** (2026-10-01, v0.7.0):
+    - Symptom: cloud edits rendered a bare `edited /home/…/arguments.py (1 replacement(s))`
+      line — no expandable diff, no line numbers. The UI renders a tool row expandable only
+      when the tool definition carries `presentCall`/`presentResult`; bash/read shadow tools
+      already did, edit/write did not (the presentation bridge leaves such rows inert by
+      design, 2026-08-31 lesson applied to the wrong subset).
+    - edit/write now carry the official dsh-tool-fs presentation trio: `presentCall` diff card
+      built from call arguments; `output.presentationMeta` computing context-3 hunks via
+      `structuredPatch` (`diff` ^9.0.0 added as a bundled dependency — vendored into
+      node_modules from the local npx cache because corepack could not fetch on this network;
+      a networked `pnpm install` will reconcile the lockfile); `presentResult` maps the
+      persisted meta back to a diff card, falling back to the args diff when meta is absent
+      (official edit returns undefined there, which lets raw result text replace the card —
+      exactly the look this change removes).
+    - write gained a before-image (readFile first; ENOENT-like → `operation: create` with
+      `oldText: null`, other read errors propagate) matching the official output shape
+      {path, operation, before, after}; edit output now carries before/after as an
+      LF-normalized diff basis while matching and writing stay on the raw bytes — CRLF files
+      keep their line endings (covered by a regression test).
+    - Tests: 141/141 (+3). tsc + tsdown + `test-built-lib.mjs` green; bundle verified to
+      inline the diff implementation (no runtime import beyond the profile externals).
 
 ## Rebuild (after editing src/ — client/index.js needs no build)
 

@@ -17,6 +17,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { JobRegistry } from '@deepseek-ai/dsh-jobs'
+import { structuredPatch } from 'diff'
 import type { ExecResult } from './protocol'
 import type { SshRuntime } from './ssh-service'
 import { quoteSh, type PersistentShellSession } from './engine'
@@ -120,6 +121,60 @@ function readCardView(result: PresentedResult): {
     totalLines: Number(match[3]),
     content: [{ type: 'text', text: body }],
   }
+}
+
+// --------------------------------------------- edit/write 的 diff 呈现
+// 官方 UI 对名为 edit/write 的工具走 keyed 行，仅当工具定义带
+// presentCall（pending 态）与 presentResult（完成态）的 diff 卡时才可展开
+// —— 遮蔽工具不实现则整行 inert（真机「编辑后只有一行文本」的根因）。
+// hunk 计算与 dsh-tool-fs 同款：structuredPatch 上下文 3，纯插入 oldText
+// 置 null，忽略 no-newline 标记行；before/after 经 LF 规范化作 diff 基准。
+
+/** 呈现用 hunk（presentation.d.ts FileDiff 形状；type 别名以获得隐式索引签名，presentationMeta 需可赋给 JsonValue）。 */
+type PresentFileDiff = { path: string; oldText: string | null; newText: string }
+
+/** LF 规范化（CRLF → LF）：diff 基准与官方 backend 的规范化一致。 */
+const normalizeForDiff = (value: string): string => value.replace(/\r\n/g, '\n')
+
+/** before/after 全文 → 上下文 hunk 列表（官方 computeHunkDiffs 同款）。 */
+function computeHunkDiffs(path: string, before: string, after: string): PresentFileDiff[] {
+  const patch = structuredPatch('', '', before, after, undefined, undefined, { context: 3 })
+  const diffs: PresentFileDiff[] = []
+  for (const hunk of patch.hunks) {
+    const oldLines: string[] = []
+    const newLines: string[] = []
+    for (const line of hunk.lines) {
+      if (line.startsWith('\\')) continue
+      const text = line.slice(1)
+      if (line.startsWith('-')) oldLines.push(text)
+      else if (line.startsWith('+')) newLines.push(text)
+      else {
+        oldLines.push(text)
+        newLines.push(text)
+      }
+    }
+    diffs.push({
+      path,
+      oldText: oldLines.length > 0 ? oldLines.join('\n') : null,
+      newText: newLines.join('\n'),
+    })
+  }
+  return diffs
+}
+
+/** presentResult 的 meta → hunk（官方 diffsFromMeta 同款防御性收窄；空/畸形 → undefined）。 */
+function diffsFromMeta(meta: unknown): PresentFileDiff[] | undefined {
+  if (typeof meta !== 'object' || meta === null || Array.isArray(meta)) return undefined
+  const diffs = (meta as { diffs?: unknown }).diffs
+  if (!Array.isArray(diffs) || diffs.length === 0) return undefined
+  const out: PresentFileDiff[] = []
+  for (const entry of diffs) {
+    if (typeof entry !== 'object' || entry === null) return undefined
+    const { path, oldText, newText } = entry as { path?: unknown; oldText?: unknown; newText?: unknown }
+    if (typeof path !== 'string' || (oldText !== null && typeof oldText !== 'string') || typeof newText !== 'string') return undefined
+    out.push({ path, oldText, newText })
+  }
+  return out
 }
 
 /** 简单 glob → RegExp（支持 **、*、?；其余字符按字面量）。 */
@@ -296,15 +351,52 @@ export function buildSessionTools(runtime: SshRuntime, route: SessionRoute, jobs
         additionalProperties: false,
         properties: {
           path: { type: 'string', required: true },
-          size: { type: 'integer', required: true },
+          operation: { type: 'string', enum: ['create', 'update'], required: true },
+          before: { required: true, oneOf: [{ type: 'string' }, { type: 'null' }] },
+          after: { type: 'string', required: true },
         },
       },
-      render: (_args, value) => text(`wrote ${String(value.path)} (${String(value.size)} bytes)`),
+      render: (_args, value) => text(
+        value.operation === 'create'
+          ? `created ${String(value.path)}`
+          : `wrote ${String(value.path)} (updated, ${String(value.after.length)} chars)`,
+      ),
+      presentationMeta: (args, value) => ({
+        operation: value.operation,
+        diffs: value.before === null
+          ? []
+          : computeHunkDiffs(String(args.file_path), String(value.before), String(value.after)),
+      }),
+    },
+    presentCall: (args) => ({
+      card: 'diff',
+      title: `Write ${args.file_path}`,
+      diffs: [{ path: args.file_path, oldText: null, newText: args.content }],
+      locations: [{ path: args.file_path }],
+    }),
+    presentResult: (args, result) => {
+      if (result.isError === true) return undefined
+      const diffs = diffsFromMeta(result.meta) ?? [{ path: args.file_path, oldText: null, newText: args.content }]
+      return { card: 'diff', title: `Write ${args.file_path}`, diffs }
     },
     async execute(args: { file_path: string; content: string }) {
       const path = resolveInSession(route, args.file_path)
-      const stat = await engine.writeFile(route.hostId, path, args.content)
-      return jsonSafe({ path, size: stat.size })
+      // before-image：取不到（不存在）→ null = create；读失败但非「不存在」
+      // 的错误照常上抛（写多半也会失败，不吞连接类异常）。
+      let before: string | null = null
+      try {
+        before = normalizeForDiff((await engine.readFile(route.hostId, path)).content)
+      } catch (error) {
+        if (!/no such file|ENOENT|not found/i.test(error instanceof Error ? error.message : String(error))) throw error
+        before = null
+      }
+      await engine.writeFile(route.hostId, path, args.content)
+      return jsonSafe({
+        path,
+        operation: before === null ? 'create' as const : 'update' as const,
+        before,
+        after: normalizeForDiff(args.content),
+      })
     },
   })
 
@@ -324,14 +416,34 @@ export function buildSessionTools(runtime: SshRuntime, route: SessionRoute, jobs
         properties: {
           path: { type: 'string', required: true },
           replacements: { type: 'integer', required: true },
+          before: { type: 'string', required: true },
+          after: { type: 'string', required: true },
         },
       },
       render: (_args, value) => text(`edited ${String(value.path)} (${String(value.replacements)} replacement(s))`),
+      presentationMeta: (args, value) => ({
+        diffs: computeHunkDiffs(String(args.file_path), String(value.before), String(value.after)),
+      }),
+    },
+    presentCall: (args) => ({
+      card: 'diff',
+      title: `Edit ${args.file_path}`,
+      diffs: [{ path: args.file_path, oldText: args.old_string || null, newText: args.new_string }],
+      locations: [{ path: args.file_path }],
+    }),
+    presentResult: (args, result) => {
+      if (result.isError === true) return undefined
+      // meta 缺失（旧会话回放/异常）时退回调用参数 diff，优于官方的
+      // undefined（那会让原始文本顶掉 diff 卡——正是本次要修的观感）。
+      const diffs = diffsFromMeta(result.meta) ?? [{ path: args.file_path, oldText: args.old_string || null, newText: args.new_string }]
+      return { card: 'diff', title: `Edit ${args.file_path}`, diffs }
     },
     async execute(args: { file_path: string; old_string: string; new_string: string; replace_all?: boolean }) {
       if (args.old_string === '') throw new Error('old_string must be non-empty')
       const path = resolveInSession(route, args.file_path)
       const file = await engine.readFile(route.hostId, path)
+      // 匹配与写回都在原文上进行（不惊动 CRLF 文件的行尾）；before/after
+      // 仅作为 diff 展示基准做 LF 规范化。
       const occurrences = file.content.split(args.old_string).length - 1
       if (occurrences === 0) {
         throw new Error(`old_string not found in ${path}`)
@@ -343,7 +455,12 @@ export function buildSessionTools(runtime: SshRuntime, route: SessionRoute, jobs
         ? file.content.split(args.old_string).join(args.new_string)
         : file.content.replace(args.old_string, args.new_string)
       await engine.writeFile(route.hostId, path, next)
-      return jsonSafe({ path, replacements: occurrences })
+      return jsonSafe({
+        path,
+        replacements: occurrences,
+        before: normalizeForDiff(file.content),
+        after: normalizeForDiff(next),
+      })
     },
   })
 
