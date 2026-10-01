@@ -228,12 +228,28 @@ applyable with `git apply` onto a fresh upstream clone). Summary of the changes:
       即红绿可见。工作区总冒烟 smoke-plugins.mjs 也串了三仓库的探针。
     - OS 泛化审计结论：代码已按「本机路径 node:path / 远端路径 posix」双轨设计——Windows 专属
       代码仅 `store.ts tightenWindowsAcl`（`process.platform==='win32'` 守卫）与开发用
-      `start-dsh-web.ps1`；client 端正则全部双分隔符（`[\/\\]`）。POSIX 真机验证路径（待执行，
-      MANote-W8-00 node v20.18 低于 engines ≥22.19，需 ≥22.19 的 Linux/Mac 环境）：
-      `git clone && npm install --legacy-peer-deps && npx vitest run && node scripts/check-dsh-contract.mjs <dsh树>`。
+      `start-dsh-web.ps1`；client 端正则全部双分隔符（`[\/\\]`）。
+    - **Linux 真机验证已通过（flex-1，Ubuntu x86_64 + node v22.20，2026-10-01）**：
+      `node run-linux-tests.mjs flex-1`（可复跑）——git archive 打包 → 经插件自家引擎（含 HTTP
+      代理链）SFTP 上传 → 裸容器自动自举 node v22.20（npmmirror）→ `npm install
+      --legacy-peer-deps`（npmmirror）→ vitest **154/154** + 契约探针 **30/30**。真机首跑抓到
+      两个真问题并已修复：① POSIX 本机占位根映射回归（v0.5.1 的姊妹 bug，见 change 16）；
+      ② 纯净 npm 安装缺 12 个 peer-only 的 @deepseek-ai 包（Windows 的 pnpm
+      auto-install-peers 掩盖了它）——已显式登记进 devDependencies，克隆即 `npm install
+      --legacy-peer-deps` 可用。macOS 未实测，但路径/进程分支与 Linux 同轨（glibc/darwin
+      差异仅在不涉及的 native 层）。
     - session-manager 同款探针（8 契约，含 **projectKey 实测锚点**：用磁盘上观察到的真实目录名
       锁死编码重实现，dsh 改算法时先红）；lib/index.js 增 `export const __test = { projectKey,
       encodeSegment }` 测试面。solarized 同款（4 契约：设置插槽 + 主题注册面 + token 词汇）。
+16. **Fix: POSIX-local placeholder root mapping + clean npm install** (2026-10-01, v0.9.2):
+    - `resolveRemotePath` 在 posix-绝对分支同样把「占位根本身」映射回远端根——此前仅修了
+      Windows 形态（v0.5.1）；POSIX 本机上占位路径天然 posix 绝对，落进该分支时 `rel === ''`
+      被排除，整条占位路径被当作远端路径返回（Linux/Mac 本机跑 dsh 的话侧栏树会全空）。
+      跨平台回归用例双分隔符均绿。
+    - devDependencies 显式登记 12 个 peer-only 包（dsh-scope/dsh-timeout/dsh-agent/
+      dsh-attachment/dsh-code-runtime/dsh-session/dsh-session-persistence/dsh-storage/
+      dsh-storage-domain/dsh-user-approval/cordis-plugin-include/cordis-plugin-loader）——
+      pnpm 的 auto-install-peers 在 Windows 上掩盖了纯净 npm 安装的缺口。
 
 ## Rebuild (after editing src/ — client/index.js needs no build)
 
