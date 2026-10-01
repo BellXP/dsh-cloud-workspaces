@@ -13,7 +13,7 @@ import type { SshRuntime } from '../src/ssh-service'
 const PLACEHOLDER = join(remoteRoot(), 'dev', 'L3JlbW90ZS93b3Jr')
 const REMOTE_CWD = '/remote/work'
 
-function stubRuntime(engineOverrides: Record<string, unknown> = {}): SshRuntime {
+function stubRuntime(engineOverrides: Record<string, unknown> = {}, loginEnvScript?: string): SshRuntime {
   return {
     engine: {
       status: () => ({ alias: 'dev', state: 'connected', home: '/root' }),
@@ -22,6 +22,7 @@ function stubRuntime(engineOverrides: Record<string, unknown> = {}): SshRuntime 
       writeFile: async () => ({ size: 5, mtimeMs: 2 }),
       ...engineOverrides,
     },
+    loginEnvScriptFor: async () => loginEnvScript,
     connect: async () => ({ state: 'connected', alias: 'dev', home: '/root' }),
   } as unknown as SshRuntime
 }
@@ -45,6 +46,22 @@ describe('buildSessionTools', () => {
     expect(output.success).toBe(true)
     expect(output.kind).toBe('foreground')
     expect(Object.hasOwn(output, 'exitCode')).toBe(true)
+  })
+
+  it('bash：登录环境快照可用时走快速通道（openShellSession 带 envScript）', async () => {
+    const openShellSession = vi.fn(async () => ({
+      run: async () => ({ success: true, exitCode: 0, timedOut: false, stdout: 'ok', stderr: '', durationMs: 1 }),
+      dispose: async () => { /* 桩 */ },
+    }))
+    const tools = buildSessionTools(stubRuntime({ openShellSession }, '/home/dev/.cache/dsh-cloud-workspaces/login-env.sh'), route())
+    const bash = tools.find((t) => t.name === 'bash')!
+    const output = await bash.execute({ command: 'pwd', description: 'print cwd' })
+    expect(output.success).toBe(true)
+    expect(openShellSession).toHaveBeenCalledTimes(1)
+    expect(openShellSession).toHaveBeenCalledWith('dev', {
+      initialCwd: REMOTE_CWD,
+      envScript: '/home/dev/.cache/dsh-cloud-workspaces/login-env.sh',
+    })
   })
 
   it('bash 后台分支：注册 spec（kind ssh）返回 background，不跑前台 exec', async () => {

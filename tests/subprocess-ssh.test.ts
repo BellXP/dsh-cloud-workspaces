@@ -12,7 +12,7 @@ import { posix } from 'node:path'
 import { tmpdir } from 'node:os'
 import { Context } from '@deepseek-ai/cordis'
 import SshRuntime from '../src/ssh-service'
-import SshSubprocessRuntime from '../src/subprocess-ssh'
+import SshSubprocessRuntime, { spawnSshTerminal } from '../src/subprocess-ssh'
 import type { SubprocessSpawnSpec, SubprocessTerminalSpawnSpec } from '@deepseek-ai/dsh-subprocess'
 
 /** 可编程的 ssh2 假实现：exec 流式通道 + shell + 内存 SFTP。 */
@@ -347,8 +347,19 @@ const fake = vi.hoisted(() => {
     constructor() {
       super()
       FakeClient.instances.push(this)
-      this.exec.mockImplementation((command: string, cb: (err: unknown, stream: FakeStream) => void) => {
+      this.exec.mockImplementation((command: string, optionsOrCb: unknown, maybeCb?: unknown) => {
+        const cb = (typeof optionsOrCb === 'function' ? optionsOrCb : maybeCb) as (err: unknown, stream: FakeStream) => void
         state.execCalls.push(command)
+        // PTY exec（终端快速路径，login-env.ts）：行为等同 shell 请求——
+        // 返回一个会回显 marker 的 FakeShell 通道。
+        if (typeof optionsOrCb === 'object' && optionsOrCb !== null && 'pty' in optionsOrCb) {
+          const shell = new FakeShell()
+          queueMicrotask(() => {
+            cb(null, shell as unknown as FakeStream)
+            state.shells.push(shell)
+          })
+          return this
+        }
         const stream = new FakeStream()
         stream.command = command
         queueMicrotask(() => {
@@ -745,6 +756,43 @@ describe('SshSubprocessRuntime 远程 subprocess', () => {
 
     await handle.write(':q\r')
     expect(shell.writes[1]).toBe(':q\r')
+    await fiber.dispose()
+  })
+
+  it('spawnSshTerminal 快速路径：envScript → PTY exec 非登录 bash + source 快照引导', async () => {
+    const { ctx, fiber } = await setup()
+    const connection = await ctx.ssh.getConnection()
+    const envScript = '/home/dev/.cache/dsh-cloud-workspaces/login-env.sh'
+    const promise = spawnSshTerminal(
+      connection,
+      terminalSpec({ argv: [], cwd: '/home/dev/project' }),
+      '/tmp/dsh-ssh-terminals/fastpath',
+      5,
+      { envScript },
+    )
+
+    const shell = await vi.waitFor(() => {
+      expect(fake.state.shells.length).toBe(1)
+      const s = fake.state.shells[0]!
+      expect(s.writes.length).toBe(1)
+      return s
+    })
+    const injected = shell.writes[0]!
+    // 引导先恢复快照（守卫式 source），marker/pid 照常，cd 到远端工作区。
+    expect(injected).toContain(`[ -f '${envScript}' ] && . '${envScript}'`)
+    expect(injected).toContain(`cd '/home/dev/project'`)
+    // 快速通道：PTY exec 非登录 bash，且未走 shell 请求（登录 shell）。
+    const ptyExec = fake.state.execCalls.find((command) => command.includes('--noprofile'))
+    expect(ptyExec).toContain('bash --noprofile --norc -i')
+    expect(fake.FakeClient.instances[0]!.shell).not.toHaveBeenCalled()
+
+    // pid 发布 → handle 交付（FakeShell 不真执行命令，手动预置 pid 文件）。
+    const pidMatch = /printf '%s\\n' "\$\$" > '([^']*)'/.exec(injected)
+    const sftp = await sftpOf(ctx)
+    sftp.nodes.set(pidMatch![1]!, { kind: 'file', content: Buffer.from('4242\n'), mode: 0o600, mtime: 1 })
+    const handle = await promise
+    expect(handle.pid).toBe(4242)
+    await handle.terminate()
     await fiber.dispose()
   })
 

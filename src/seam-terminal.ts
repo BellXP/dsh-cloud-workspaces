@@ -52,6 +52,9 @@ export function installRemoteTerminalSeam(ctx: Context, runtime: SshRuntime, ena
       // getConnectionFor 先建连/复用连接池；失败（主机不可达等）原样上抛，
       // 控制器把 create 失败透传给浏览器。
       const connection = await runtime.getConnectionFor(route.hostId)
+      // 登录环境快照（慢 profile 主机 24~77s → ~1s）：无快照回退登录 shell。
+      const envScript = await runtime.loginEnvScriptFor(route.hostId).catch(() => undefined)
+      debugLog(`terminal seam: ${envScript !== undefined ? `fast path (env snapshot: ${envScript})` : 'login shell path'}`)
       const terminal = await spawnSshTerminal(
         connection,
         {
@@ -65,6 +68,7 @@ export function installRemoteTerminalSeam(ctx: Context, runtime: SshRuntime, ena
         },
         posix.join('/tmp', 'dsh-ssh-terminals', randomUUID()),
         POLL_MS,
+        envScript !== undefined ? { envScript } : undefined,
       )
       if (disposed) {
         await terminal.terminate()

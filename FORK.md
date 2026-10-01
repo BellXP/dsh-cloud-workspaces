@@ -167,6 +167,35 @@ applyable with `git apply` onto a fresh upstream clone). Summary of the changes:
       keep their line endings (covered by a regression test).
     - Tests: 141/141 (+3). tsc + tsdown + `test-built-lib.mjs` green; bundle verified to
       inline the diff implementation (no runtime import beyond the profile externals).
+12. **Feature: login-env snapshots — fast terminals & session shells on slow-profile hosts**
+    (2026-10-01, v0.8.0):
+    - Diagnosis (live, MANote-W8-00): bare connect 517 ms, non-login shell 532 ms, but a
+      LOGIN shell takes **24–77 s** — `~/.bashrc` line 11 sources
+      `/usr/local/Ascend/nnal/atb/set_env.sh`, which imports torch_npu/collect_env on every
+      login. The sidebar terminal (login shell) and the session persistent shell (`bash -l`)
+      both pay it; only the first is visible as "terminal starts slowly".
+    - **Capture** (`src/login-env.ts` + `SshRuntime.captureLoginEnv`): one background
+      `bash -lc 'export -p; declare -f; alias; PS1'` per host, volatile vars filtered
+      (SSH_*/PWD/SHLVL/TERM/COLUMNS/…), assembled into a sourceable snapshot written to
+      `~/.cache/dsh-cloud-workspaces/login-env.sh` on the host and registered in the store
+      (`loginEnv` field on host entries, survives host edits).
+    - **Replay**: the sidebar terminal opens `bash --noprofile --norc -i` via exec-with-PTY
+      (engine.openShell gained an optional command) and bootstraps
+      `[ -f snapshot ] && . snapshot; cd <workspace>; marker/pid…`; the session persistent
+      shell opens `bash --noprofile --norc` with the same source line (constructor and every
+      rebuild). Environment parity: exports + shell functions (declare -f) + aliases + PS1.
+    - **Zero-config adoption**: first successful connection per host fires the capture in
+      the background (once per boot; results persist in the store); terminals wait an
+      in-flight capture at most 3 s. `loginEnvScriptFor` verifies the remote file once per
+      boot (one `test -f` exec) and returns undefined when missing — every consumer then
+      falls back to the original login-shell path, so a lost/stale snapshot can never make
+      things worse. Settings → SSH 连接 gained a 预热终端环境 button (typert
+      `refreshLoginEnv`) to re-capture after profile changes; HostRow shows the result pill.
+    - Tests: 152/152 (+11): login-env parse/assemble/volatile-filter/PS1-quoting; capture →
+      store → verified-path flow; remote-missing → undefined fallback; auto-capture fired on
+      connect; fast terminal spawn (PTY exec + guarded source + no shell request); session
+      shell envScript pass-through. FakeClient exec mocks now accept the 3-arg
+      (command, {pty}, cb) form.
 
 ## Rebuild (after editing src/ — client/index.js needs no build)
 

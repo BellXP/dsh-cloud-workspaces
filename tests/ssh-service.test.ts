@@ -60,6 +60,8 @@ const fake = vi.hoisted(() => {
     static instances: FakeClient[] = []
     /** 下一次 connect 的行为：ready（默认）或 error（模拟临时不可达）。 */
     static nextConnectBehavior: 'ready' | 'error' = 'ready'
+    /** 全部 exec 命令记录（登录环境快照的自动触发断言用）。 */
+    static execLog: string[] = []
     exec = vi.fn()
     shell = vi.fn()
     sftp = vi.fn()
@@ -70,6 +72,7 @@ const fake = vi.hoisted(() => {
       FakeClient.instances.push(this)
       // 默认 exec：模拟一条成功命令（输出 'ok'，退出码 0）。
       this.exec.mockImplementation((command: string, cb: (err: unknown, stream: FakeStream) => void) => {
+        FakeClient.execLog.push(command)
         const stream = new FakeStream()
         queueMicrotask(() => {
           cb(null, stream)
@@ -228,5 +231,114 @@ describe('SshRuntime 连接生命周期', () => {
     const connection = await runtime.getConnection()
     expect(connection.alias).toBe('dev')
     expect(fake.FakeClient.instances.length).toBe(failedAttempts + 1)
+  })
+})
+
+describe('SshRuntime 登录环境快照（终端加速）', () => {
+  beforeEach(() => {
+    fake.FakeClient.instances.length = 0
+    fake.FakeClient.execLog.length = 0
+    fake.FakeClient.nextConnectBehavior = 'ready'
+  })
+
+  /** 极简 exec 流：注册 data 即投递文本，注册 close 时按 code 结束。 */
+  function streamOf(text: string, code = 0): unknown {
+    return {
+      stderr: { on() { return this } },
+      on(event: string, cb: (...args: unknown[]) => void) {
+        if (event === 'data' && text !== '') cb(Buffer.from(text))
+        if (event === 'close') queueMicrotask(() => cb(code, null))
+        return this
+      },
+    }
+  }
+
+  const SNAPSHOT = [
+    '__DSH_ENV_BEGIN__',
+    'declare -x ATB_HOME="/usr/local/atb"',
+    'declare -x SHLVL="2"',
+    '',
+    '__DSH_ENV_FUNCS__',
+    '',
+    '__DSH_ENV_ALIASES__',
+    '',
+    '__DSH_ENV_PS1__$ ',
+  ].join('\n')
+
+  /** 武装捕获：capture 命令回快照，探针按 probeOk，其余 'ok'；SFTP 记录写入。 */
+  function armCapture(
+    client: { exec: ReturnType<typeof vi.fn>; sftp: ReturnType<typeof vi.fn> },
+    opts: { probeOk?: boolean; written?: Array<{ path: string; content: string }> },
+  ): void {
+    client.sftp.mockImplementation((cb: (err: unknown, sftp: unknown) => void) => {
+      queueMicrotask(() => cb(null, {
+        writeFile: (path: string, data: Buffer, done: (e?: Error) => void) => {
+          opts.written?.push({ path, content: data.toString('utf8') })
+          done()
+        },
+        stat: (_path: string, done: (e: Error | undefined, s: unknown) => void) => done(undefined, { size: 1, mtime: 1 }),
+      }))
+    })
+    client.exec.mockImplementation((command: string, cb: (err: unknown, stream: unknown) => void) => {
+      const isProbe = command.startsWith('test -f ')
+      const text = command.includes('__DSH_ENV_BEGIN__') ? `${SNAPSHOT}\n` : isProbe && opts.probeOk === false ? '' : 'ok\n'
+      const code = isProbe && opts.probeOk === false ? 1 : 0
+      queueMicrotask(() => cb(null, streamOf(text, code)))
+    })
+  }
+
+  async function setupHost(storeFile = tmpStoreFile()): Promise<{ fiber: Fiber; runtime: SshRuntime; storeFile: string }> {
+    const context = new Context()
+    const f = await context.plugin(SshRuntime, { storeFile })
+    const service = context.ssh
+    service.upsertHost({
+      alias: 'dev',
+      host: '10.0.0.1',
+      user: 'root',
+      auth: { kind: 'password', password: 'secret' },
+    })
+    return { fiber: f, runtime: service, storeFile }
+  }
+
+  it('首次连接自动触发后台捕获（无需手动预热）', async () => {
+    const { fiber, runtime } = await setupHost()
+    await runtime.connect('dev')
+    // 默认 exec 返回 'ok'（解析必失败）——断言点在捕获命令确实被自动发出。
+    await vi.waitFor(() => {
+      expect(fake.FakeClient.execLog.some((command) => command.includes('__DSH_ENV_BEGIN__'))).toBe(true)
+    })
+    await fiber.dispose()
+  })
+
+  it('captureLoginEnv：捕获 → 写远端快照 + store 登记；loginEnvScriptFor 免探针返回路径', async () => {
+    const { fiber, runtime } = await setupHost()
+    await runtime.connect('dev')
+    const client = fake.FakeClient.instances[0]!
+    const written: Array<{ path: string; content: string }> = []
+    armCapture(client, { written })
+
+    const record = await runtime.captureLoginEnv('dev')
+    expect(record.varCount).toBe(1) // SHLVL 等易变量被过滤
+    expect(record.remotePath).toBe('ok/.cache/dsh-cloud-workspaces/login-env.sh')
+    expect(written[0]?.path).toBe(record.remotePath)
+    expect(written[0]?.content).toContain('declare -x ATB_HOME=')
+    // 捕获即验证记账命中——直接返回路径，无额外探针往返。
+    await expect(runtime.loginEnvScriptFor('dev')).resolves.toBe(record.remotePath)
+    await fiber.dispose()
+  })
+
+  it('登记过但远端快照丢失 → loginEnvScriptFor 返回 undefined（回退登录 shell）', async () => {
+    const { fiber: f1, runtime: r1, storeFile } = await setupHost()
+    await r1.connect('dev')
+    armCapture(fake.FakeClient.instances[0]!, {})
+    await r1.captureLoginEnv('dev')
+    await f1.dispose()
+
+    // 新 runtime、同一 store：登记在、验证不在 → 探针失败 → undefined。
+    const { fiber: f2, runtime: r2 } = await setupHost(storeFile)
+    await r2.connect('dev') // 已登记 → 只记账，不自动重捕
+    armCapture(fake.FakeClient.instances.at(-1)!, { probeOk: false })
+    await expect(r2.loginEnvScriptFor('dev')).resolves.toBeUndefined()
+    await f2.dispose()
   })
 })

@@ -62,8 +62,20 @@ export interface SshHostEntry {
   environment?: string
   /** Free-form tags. */
   tags: string[]
+  /** 登录环境快照（慢 profile 主机的终端/会话 shell 加速）：远端脚本路径与生成时间。 */
+  loginEnv?: LoginEnvRecord
   createdAt: number
   updatedAt: number
+}
+
+/** 登录环境快照的登记信息（不含任何环境内容本身）。 */
+export interface LoginEnvRecord {
+  /** 远端脚本绝对路径（~/.cache/dsh-cloud-workspaces/login-env.sh）。 */
+  remotePath: string
+  /** 捕获时间（epoch ms）。 */
+  generatedAt: number
+  /** 捕获到的环境变量个数（诊断用）。 */
+  varCount: number
 }
 
 /** Public (secret-free) projection of an entry, safe for the browser/agent. */
@@ -81,6 +93,8 @@ export interface SshHostSummary {
   description?: string
   environment?: string
   tags: string[]
+  /** 登录环境快照登记（脱敏：仅路径/时间/计数）。 */
+  loginEnv?: LoginEnvRecord
   createdAt: number
   updatedAt: number
 }

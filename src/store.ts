@@ -213,6 +213,7 @@ export class HostStore {
       description: entry.description,
       environment: entry.environment,
       tags: [...entry.tags],
+      loginEnv: entry.loginEnv,
       createdAt: entry.createdAt,
       updatedAt: entry.updatedAt,
     }
@@ -220,6 +221,14 @@ export class HostStore {
 
   get(alias: string): SshHostEntry | undefined {
     return this.entries.get(alias)
+  }
+
+  /** 更新登录环境快照登记（终端加速；不动其他字段）。 */
+  setLoginEnv(alias: string, record: SshHostEntry['loginEnv']): void {
+    const entry = this.entries.get(alias)
+    if (entry === undefined) throw new Error(`unknown host alias: ${JSON.stringify(alias)}`)
+    entry.loginEnv = record
+    this.save()
   }
 
   /** Create or update an entry (by the payload alias or entry.alias). */
@@ -240,6 +249,8 @@ export class HostStore {
       description: payload.description ?? prev?.description,
       environment: payload.environment ?? prev?.environment,
       tags: payload.tags ?? prev?.tags ?? [],
+      // 登录环境快照与主机编辑正交：编辑主机不清除已捕获的快照登记。
+      loginEnv: prev?.loginEnv,
       createdAt: prev?.createdAt ?? now,
       updatedAt: now,
     }

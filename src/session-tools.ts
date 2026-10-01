@@ -213,13 +213,25 @@ export function buildSessionTools(runtime: SshRuntime, route: SessionRoute, jobs
   let shell: PersistentShellSession | undefined
 
   /**
+   * 会话常驻 shell 惰性打开：登录环境快照可用时走快速路径（非登录 bash +
+   * source 快照，慢 profile 主机首命令 ~77s → ~50ms；见 login-env.ts）。
+   */
+  const openSessionShell = async (): Promise<PersistentShellSession> => {
+    const envScript = await runtime.loginEnvScriptFor(route.hostId).catch(() => undefined)
+    return engine.openShellSession(route.hostId, {
+      initialCwd: route.remoteCwd,
+      ...(envScript !== undefined ? { envScript } : {}),
+    })
+  }
+
+  /**
    * 在会话常驻 shell 上跑只读探查命令（grep/glob 与 bash 共享同一条通道，
    * 省掉每次一次性 exec 的 ~300ms 建连开销）。命令一律用绝对路径、不传
    * cwd——不扰动 shell 的持久目录；超时与降级语义沿用 PersistentShell
    * （超时杀通道下次重建，传输错误降级一次性 exec）。
    */
   const probeOnSessionShell = async (command: string, timeoutMs: number): Promise<ExecResult> => {
-    shell ??= await engine.openShellSession(route.hostId, { initialCwd: route.remoteCwd })
+    shell ??= await openSessionShell()
     return shell.run(command, { timeoutMs })
   }
 
@@ -281,7 +293,7 @@ export function buildSessionTools(runtime: SshRuntime, route: SessionRoute, jobs
       }
       // 前台命令走会话常驻 shell（连接池上复用一条 bash 通道）：
       // 显式 workdir 才强制 cd，否则沿用 shell 当前目录（持久化语义）。
-      shell ??= await engine.openShellSession(route.hostId, { initialCwd: route.remoteCwd })
+      shell ??= await openSessionShell()
       const result = await shell.run(args.command, {
         ...(args.workdir !== undefined && args.workdir !== '' ? { cwd } : {}),
         ...(args.timeoutMs !== undefined ? { timeoutMs: args.timeoutMs } : {}),

@@ -23,6 +23,13 @@ import type {
   WorkspaceStatus,
 } from './protocol'
 import { expandHome, type HostStore } from './store'
+import { LOGIN_ENV_CAPTURE_COMMAND, assembleLoginEnvScript, loginEnvRemotePath } from './login-env'
+
+/**
+ * 快速 shell 命令（登录环境快照重放路径）：非登录、无 rc，环境完全由
+ * source 快照恢复。`-i` 仅用于 PTY 终端；会话常驻 shell 用非交互形态。
+ */
+const FAST_SHELL_COMMAND = 'bash --noprofile --norc'
 
 /** Engine knobs. */
 export interface EngineOptions {
@@ -343,11 +350,21 @@ class PersistentShellImpl implements PersistentShellSession {
     stream: import('ssh2').ClientChannel,
     initialCwd: string | undefined,
     private readonly idleMs: number,
+    /** 登录环境快照（可选）：通道开非登录 bash，先 source 快照再 cd。 */
+    private readonly envScript: string | undefined,
   ) {
     this.resumeCwd = initialCwd
     this.bindChannel(stream)
-    if (initialCwd !== undefined) {
-      stream.write(`cd ${quoteSh(initialCwd)}\n`)
+    this.bootstrap(stream)
+  }
+
+  /** 新通道的引导：先恢复环境快照（如有），再回到最近已知目录。 */
+  private bootstrap(stream: import('ssh2').ClientChannel): void {
+    if (this.envScript !== undefined) {
+      stream.write(`[ -f ${quoteSh(this.envScript)} ] && . ${quoteSh(this.envScript)}\n`)
+    }
+    if (this.resumeCwd !== undefined) {
+      stream.write(`cd ${quoteSh(this.resumeCwd)}\n`)
     }
   }
 
@@ -430,12 +447,13 @@ class PersistentShellImpl implements PersistentShellSession {
 
   private async runOnChannel(command: string, options?: { cwd?: string; timeoutMs?: number }): Promise<ExecResult> {
     if (this.broken || this.binding === undefined) {
-      const reopened = await this.engine.openShellChannel(this.alias)
+      const reopened = await this.engine.openShellChannel(
+        this.alias,
+        this.envScript !== undefined ? FAST_SHELL_COMMAND : undefined,
+      )
       this.bindChannel(reopened.stream)
-      // 重建后恢复到最近已知目录（持久化语义跨重建保持）。
-      if (this.resumeCwd !== undefined) {
-        reopened.stream.write(`cd ${quoteSh(this.resumeCwd)}\n`)
-      }
+      // 重建后恢复：环境快照（如有）+ 最近已知目录（持久化语义跨重建保持）。
+      this.bootstrap(reopened.stream)
     }
     const binding = this.binding
     if (binding === undefined) throw new Error('persistent shell: no channel')
@@ -899,8 +917,8 @@ export class SshEngine {
   }
 
   /**
-   * 打开一个常驻 shell 会话（B 方案：会话内全部前台命令复用同一条
-   * `bash -l` 通道）。命令经哨兵协议发送/回收：
+   * 打开一个常驻 shell 会话（B 方案：会话内全部前台命令复用同一条通道）。
+   * 命令经哨兵协议发送/回收：
    *
    *   <command>
    *   printf '__DSH_S_<id>__%s %s\n' "$?" "$PWD"
@@ -913,17 +931,21 @@ export class SshEngine {
    *
    * 超时 = 关闭整条通道（杀死 bash 及其子进程），下次调用自动重建；
    * 传输/协议错误 = 降级为一次性 exec（保证命令仍被执行）并标记重建。
+   *
+   * envScript（登录环境快照，见 login-env.ts）：给定时通道改开非登录
+   * bash，source 快照后语义等价（慢 profile 主机首命令 ~77s → ~50ms）。
    */
-  async openShellSession(alias: string, options?: { initialCwd?: string }): Promise<PersistentShellSession> {
-    const initial = await this.openShellChannel(alias)
-    return new PersistentShellImpl(this, alias, initial.stream, options?.initialCwd, this.opts.idleTimeoutMs)
+  async openShellSession(alias: string, options?: { initialCwd?: string; envScript?: string }): Promise<PersistentShellSession> {
+    const envScript = options?.envScript
+    const initial = await this.openShellChannel(alias, envScript !== undefined ? FAST_SHELL_COMMAND : undefined)
+    return new PersistentShellImpl(this, alias, initial.stream, options?.initialCwd, this.opts.idleTimeoutMs, envScript)
   }
 
-  /** Open one raw `bash -l` channel on the host's pooled connection. */
-  async openShellChannel(alias: string): Promise<{ stream: import('ssh2').ClientChannel }> {
+  /** Open one raw shell channel on the host's pooled connection (default `bash -l`). */
+  async openShellChannel(alias: string, command?: string): Promise<{ stream: import('ssh2').ClientChannel }> {
     const record = await this.ensureConnection(alias)
     return await new Promise<{ stream: import('ssh2').ClientChannel }>((resolve, reject) => {
-      record.client.exec('bash -l', (error, stream) => {
+      record.client.exec(command ?? 'bash -l', (error, stream) => {
         if (error !== undefined && error !== null) reject(error)
         else resolve({ stream })
       })
@@ -995,13 +1017,17 @@ export class SshEngine {
 
   // ---------------------------------------------------------------- shell
 
-  /** Open a PTY shell on the active connection (WebSocket terminal). */
-  async openShell(alias: string, cols: number, rows: number): Promise<ShellSession> {
+  /**
+   * Open a PTY shell on the active connection (WebSocket terminal).
+   * `command` 给定时改走 exec-with-PTY（非登录 shell——登录环境由调用方
+   * 经快照重放，绕开慢 profile；terminal seam 的快速路径）。
+   */
+  async openShell(alias: string, cols: number, rows: number, command?: string): Promise<ShellSession> {
     const record = await this.ensureConnection(alias)
     record.inFlight += 1
     record.idleAt = Date.now()
     return await new Promise<ShellSession>((resolve, reject) => {
-      record.client.shell({ term: 'xterm-256color', cols, rows }, (error, channel) => {
+      const onChannel = (error: Error | undefined, channel: import('ssh2').ClientChannel): void => {
         if (error) {
           record.inFlight -= 1
           reject(error)
@@ -1045,8 +1071,39 @@ export class SshEngine {
           session.onExit?.(null, error.message)
         })
         resolve(session)
-      })
+      }
+      if (command !== undefined) {
+        record.client.exec(command, { pty: { term: 'xterm-256color', cols, rows } }, onChannel)
+      } else {
+        record.client.shell({ term: 'xterm-256color', cols, rows }, onChannel)
+      }
     })
+  }
+
+  // ------------------------------------------------------------- login-env
+
+  /**
+   * 捕获登录环境快照（跑一次完整 `bash -lc`；慢 profile 主机可达数十秒，
+   * 只在后台/手动触发，绝不在终端打开的关键路径上）。解析失败或标记缺失
+   * 抛错——调用方回退登录 shell 并可重试。
+   */
+  async captureLoginEnv(alias: string): Promise<{ remotePath: string; varCount: number }> {
+    await this.resolveHome(alias)
+    const home = this.homeOf(alias)
+    if (home === undefined || home === '') {
+      throw new Error('ssh engine: cannot resolve remote home for login-env capture')
+    }
+    const result = await this.exec(alias, LOGIN_ENV_CAPTURE_COMMAND, { timeoutMs: 240_000 })
+    if (!result.success) {
+      throw new Error(`login-env capture failed: ${result.error ?? result.stderr.slice(0, 400)}`)
+    }
+    const assembled = assembleLoginEnvScript(result.stdout)
+    if (assembled === undefined) {
+      throw new Error('login-env capture: could not parse the environment snapshot')
+    }
+    const remotePath = loginEnvRemotePath(home)
+    await this.writeFile(alias, remotePath, assembled.script)
+    return { remotePath, varCount: assembled.varCount }
   }
 
   // ------------------------------------------------------------------ sftp

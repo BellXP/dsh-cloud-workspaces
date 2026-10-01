@@ -1195,11 +1195,15 @@ export class SshTerminalHandle implements SubprocessTerminalHandle {
  * Open an SSH PTY, inject `exec <argv>`, and return only after the shell has
  * published its pid through the private marker.
  */
+/** 快速终端命令：非登录交互 bash，登录环境由快照 source 恢复（login-env.ts）。 */
+const FAST_TERMINAL_COMMAND = 'bash --noprofile --norc -i'
+
 export async function spawnSshTerminal(
   connection: SshConnection,
   spec: SubprocessTerminalSpawnSpec,
   stateDir: string,
   pollMs: number,
+  opts?: { envScript?: string },
 ): Promise<SshTerminalHandle> {
   spec.signal?.throwIfAborted()
   const paths = {
@@ -1217,7 +1221,11 @@ export async function spawnSshTerminal(
     )
     stateDirectoryCreated = true
     spec.signal?.throwIfAborted()
-    shell = await connection.openShell(spec.cols, spec.rows)
+    // envScript（登录环境快照）：非登录交互 shell + 引导时 source 快照——
+    // 跳过远端登录 profile（慢主机 24~77s → ~1s），环境等价。
+    shell = opts?.envScript !== undefined
+      ? await connection.openShell(spec.cols, spec.rows, FAST_TERMINAL_COMMAND)
+      : await connection.openShell(spec.cols, spec.rows)
     // The login shell prints the marker, publishes its pid, then replaces
     // itself with the requested argv (spec.env becomes a shell-prefix overlay;
     // the PTY keeps the login environment — see the module doc).
@@ -1230,8 +1238,11 @@ export async function spawnSshTerminal(
       : spec.cwd !== undefined && posix.isAbsolute(spec.cwd) ? `cd ${quoteShellArg(spec.cwd)}` : ''
     // `\\n` stays a literal backslash-n in the injected text so the remote
     // shell's printf interprets it as the standard newline escape.
+    const envPrelude = opts?.envScript !== undefined
+      ? `[ -f ${quoteShellArg(opts.envScript)} ] && . ${quoteShellArg(opts.envScript)}; `
+      : ''
     const command = [
-      `printf ${quoteShellArg(`${outputMarker}\\n`)}`,
+      `${envPrelude}printf ${quoteShellArg(`${outputMarker}\\n`)}`,
       `printf ${quoteShellArg('%s\\n')} "$$" > ${quoteShellArg(paths.pid)}`,
       `${launch}\r`,
     ].join('; ')

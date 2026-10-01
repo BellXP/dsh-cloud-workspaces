@@ -68,6 +68,7 @@ window.__ModuleLoader__.load({
         desc('removeRemote', ['hostId', 'path'], 'RemoveRemoteResult'),
         desc('createPlaceholder', ['hostId', 'remotePath'], 'CreatePlaceholderResult'),
         desc('listPlaceholders', [], 'ListPlaceholdersResult'),
+        desc('refreshLoginEnv', ['hostId'], 'RefreshLoginEnvResult'),
       ],
     }
 
@@ -350,9 +351,10 @@ window.__ModuleLoader__.load({
 
     // ---------------------------------------------------------- component
 
-    /** 主机行：名称/地址/认证 + 测试/编辑/删除。 */
-    function HostRow({ host, hasSecret, onTest, onEdit, onDelete }) {
+    /** 主机行：名称/地址/认证 + 测试/预热/编辑/删除。 */
+    function HostRow({ host, hasSecret, onTest, onWarmup, onEdit, onDelete }) {
       const [testing, setTesting] = useState(false)
+      const [warming, setWarming] = useState(false)
       const [result, setResult] = useState(null) // { ok, message } | null
       const run = useCallback(async () => {
         setTesting(true); setResult(null)
@@ -367,6 +369,19 @@ window.__ModuleLoader__.load({
         }
         setTesting(false)
       }, [onTest])
+      const warmup = useCallback(async () => {
+        setWarming(true); setResult(null)
+        try {
+          const res = await onWarmup()
+          const value = unwrap(res, null)
+          setResult(value && value.remotePath
+            ? { ok: true, message: '终端环境已预热（' + value.varCount + ' 个变量）——下次打开终端 ~1 秒' }
+            : { ok: false, message: resError(res, '预热失败') })
+        } catch (error) {
+          setResult({ ok: false, message: String((error && error.message) || error) })
+        }
+        setWarming(false)
+      }, [onWarmup])
       const authLabel = host.authType === 'password' ? (hasSecret ? '密码已保存' : '密码') : '密钥'
       const children = [
         h('div', { className: 'dri-cardHead' },
@@ -375,7 +390,8 @@ window.__ModuleLoader__.load({
             h('div', { className: 'dri-cardSub' }, host.user + '@' + host.host + ':' + host.port)),
           h('div', { className: 'dri-actions' },
             h('span', { className: 'dri-pill' }, authLabel),
-            h('button', { className: 'dri-btn', disabled: testing, onClick: run }, testing ? '测试中…' : '测试'),
+            h('button', { className: 'dri-btn', disabled: testing || warming, onClick: run }, testing ? '测试中…' : '测试'),
+            h('button', { className: 'dri-btn', disabled: testing || warming, title: '捕获登录环境快照（慢启动主机只需一次，之后终端秒开）', onClick: warmup }, warming ? '预热中…' : '预热终端环境'),
             h('button', { className: 'dri-btn', onClick: onEdit }, '编辑'),
             h('button', { className: 'dri-btn dri-btn-danger', onClick: onDelete }, '删除'))),
       ]
@@ -510,6 +526,7 @@ window.__ModuleLoader__.load({
           : h('ul', { className: 'dri-cards' }, hosts.map((host) => h(HostRow, {
               key: host.id, host, hasSecret: !!state.secrets[host.id],
               onTest: () => testConnection(host),
+              onWarmup: () => withTimeout(svc().refreshLoginEnv(host.id), 240_000, '预热终端环境（慢启动主机首次可能需要一两分钟）'),
               onEdit: () => setEditing({ mode: 'edit', host }),
               onDelete: () => setPendingDelete(host.id),
             }))),

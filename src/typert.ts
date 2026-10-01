@@ -93,6 +93,7 @@ export const HOST_TYPERT_CONTRIBUTION: HostTypertContribution = {
     hostInvocation('removeRemote', ['hostId', 'path']),
     hostInvocation('createPlaceholder', ['hostId', 'remotePath']),
     hostInvocation('listPlaceholders', []),
+    hostInvocation('refreshLoginEnv', ['hostId']),
   ],
   model: undefined,
 }
@@ -321,5 +322,15 @@ export class SshRemoteService extends Service {
   async listPlaceholders(): Promise<Array<{ hostId: string; remotePath: string; localPath: string }>> {
     const listed = await listPlaceholders()
     return listed.map(w => ({ hostId: w.hostId, remotePath: w.remotePath, localPath: w.localPath }))
+  }
+
+  /**
+   * 捕获/刷新登录环境快照（慢 profile 主机的终端/会话 shell 加速）：
+   * 跑一次完整 `bash -lc` 采集变量/函数/alias/PS1，写远端快照并登记。
+   * 慢主机可能需要数十秒——client 侧按钮带「进行中」状态与超时保护。
+   */
+  async refreshLoginEnv(hostId: string): Promise<{ remotePath: string; generatedAt: number; varCount: number }> {
+    const record = await this.runtime.captureLoginEnv(hostId)
+    return jsonSafe(record)
   }
 }

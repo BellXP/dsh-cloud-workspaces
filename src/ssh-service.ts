@@ -18,11 +18,12 @@
 import { Service } from '@deepseek-ai/cordis'
 import type { Context } from '@deepseek-ai/cordis'
 import z from 'schemastery'
-import { SshEngine } from './engine'
+import { SshEngine, quoteSh } from './engine'
 import type { SshExecChannel, ShellSession } from './engine'
-import type { ExecResult, RemoteDirEntry, RemoteFileContent, WorkspaceStatus } from './protocol'
+import type { ExecResult, LoginEnvRecord, RemoteDirEntry, RemoteFileContent, WorkspaceStatus } from './protocol'
 import type { HostPayload } from './protocol'
 import { HostStore } from './store'
+import { debugLog } from './debug-log'
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
@@ -73,8 +74,11 @@ export interface SshConnection {
   exec(command: string, options?: { timeoutMs?: number; cwd?: string }): Promise<ExecResult>
   /** 打开一个低层流式命令通道（subprocess-ssh 的 wrapper 传输）。 */
   execChannel(command: string, options?: { cwd?: string }): Promise<SshExecChannel>
-  /** 打开一个 PTY shell 会话。 */
-  openShell(cols: number, rows: number): Promise<ShellSession>
+  /**
+   * 打开一个 PTY shell 会话。`command` 给定时改走 exec-with-PTY（非登录
+   * shell，登录环境由调用方经快照重放——慢 profile 主机的快速路径）。
+   */
+  openShell(cols: number, rows: number, command?: string): Promise<ShellSession>
   /** 列出远程目录。 */
   ls(path: string): Promise<RemoteDirEntry[]>
   /** 读取远程文件文本（超过 maxReadBytes 截断）。 */
@@ -203,7 +207,76 @@ export class SshRuntime extends Service {
     await this.engine_.ensureConnection(alias)
     await this.engine_.resolveHome(alias)
     if (this.disposed) throw new Error('ssh runtime is disposing')
+    this.ensureLoginEnv(alias)
     return this.wrap(alias)
+  }
+
+  // ------------------------------------------------------- login-env 加速
+
+  /** 本次启动内每主机的自动捕获去重（无论成败只自动尝试一次）。 */
+  private readonly loginEnvAttempted = new Set<string>()
+  /** 启动后验证过远端仍存在的快照路径（alias → remotePath）。 */
+  private readonly loginEnvVerified = new Map<string, string>()
+  /** 进行中的捕获（loginEnvScriptFor 最多等它 3s——快主机首开终端即加速）。 */
+  private readonly loginEnvPending = new Map<string, Promise<unknown>>()
+
+  /**
+   * 后台确保该主机有登录环境快照（首次连接后自动触发一次；已在 store
+   * 登记则只做验证记账）。失败仅 debugLog，绝不影响连接语义。
+   */
+  private ensureLoginEnv(alias: string): void {
+    if (this.disposed || this.loginEnvAttempted.has(alias) || this.loginEnvPending.has(alias)) return
+    const recorded = this.engine_.getEntry(alias)?.loginEnv
+    if (recorded !== undefined) {
+      this.loginEnvAttempted.add(alias)
+      return
+    }
+    this.loginEnvAttempted.add(alias)
+    const pending = this.captureLoginEnv(alias)
+      .catch((error: unknown) => {
+        debugLog(`login-env: background capture failed for ${alias}: ${error instanceof Error ? error.message : String(error)}`)
+      })
+      .finally(() => { this.loginEnvPending.delete(alias) })
+    this.loginEnvPending.set(alias, pending)
+  }
+
+  /** 捕获/刷新登录环境快照：engine 采集写远端 + store 登记（typert 手动按钮同款）。 */
+  async captureLoginEnv(alias: string): Promise<LoginEnvRecord> {
+    const captured = await this.engine_.captureLoginEnv(alias)
+    const record: LoginEnvRecord = {
+      remotePath: captured.remotePath,
+      generatedAt: Date.now(),
+      varCount: captured.varCount,
+    }
+    this.store.setLoginEnv(alias, record)
+    this.loginEnvVerified.set(alias, record.remotePath)
+    this.loginEnvAttempted.add(alias)
+    debugLog(`login-env: captured ${captured.varCount} vars for ${alias} → ${record.remotePath}`)
+    return record
+  }
+
+  /**
+   * 终端/会话 shell 的快速路径取数：返回已登记**且远端仍存在**的快照路径；
+   * 没有则 undefined（调用方回退登录 shell）。进行中的后台捕获最多等 3s。
+   */
+  async loginEnvScriptFor(alias: string): Promise<string | undefined> {
+    const pending = this.loginEnvPending.get(alias)
+    if (pending !== undefined) {
+      await Promise.race([pending, new Promise((resolve) => setTimeout(resolve, 3000))])
+    }
+    const recorded = this.engine_.getEntry(alias)?.loginEnv
+    if (recorded === undefined) return undefined
+    if (this.loginEnvVerified.get(alias) === recorded.remotePath) return recorded.remotePath
+    try {
+      const probe = await this.engine_.exec(alias, `test -f ${quoteSh(recorded.remotePath)} && echo ok`, { timeoutMs: 10_000 })
+      if (probe.success && probe.stdout.trim() === 'ok') {
+        this.loginEnvVerified.set(alias, recorded.remotePath)
+        return recorded.remotePath
+      }
+    } catch {
+      // 探测异常（连接抖动等）按无快照处理——回退登录 shell，不阻塞终端。
+    }
+    return undefined
   }
 
   // ----------------------------------------------------------- host store
@@ -246,6 +319,7 @@ export class SshRuntime extends Service {
     if (alias === '') throw new Error('ssh runtime: no active connection; call connect(alias) first')
     await this.engine_.ensureConnection(alias)
     await this.engine_.resolveHome(alias)
+    this.ensureLoginEnv(alias)
     return this.wrap(alias)
   }
 
@@ -263,7 +337,7 @@ export class SshRuntime extends Service {
       },
       exec: (command, options) => engine.exec(alias, command, options),
       execChannel: (command, options) => engine.openChannel(alias, command, options),
-      openShell: (cols, rows) => engine.openShell(alias, cols, rows),
+      openShell: (cols, rows, command) => engine.openShell(alias, cols, rows, command),
       ls: (path) => engine.ls(alias, path),
       readFile: (path) => engine.readFile(alias, path),
       writeFile: (path, content) => engine.writeFile(alias, path, content),
