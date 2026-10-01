@@ -196,6 +196,25 @@ applyable with `git apply` onto a fresh upstream clone). Summary of the changes:
       connect; fast terminal spawn (PTY exec + guarded source + no shell request); session
       shell envScript pass-through. FakeClient exec mocks now accept the 3-arg
       (command, {pty}, cb) form.
+13. **Feature: quick-add to conversation from the sidebar** (2026-10-01, v0.9.0):
+    - Insertion core (client): the official composer is session-addressed via
+      `sessions.scope(id).get('conversation').input.for(actx)` → shell (`insertText` with an
+      end-of-draft span + `draftRev` CAS, `setDraft` fallback, `focus`). The main session is
+      the `retainedBy.mainView > 0` row — same rule the official workspace UI uses. Plain
+      `@path ` text is auto-decorated into a chip by the composer's scan, so no chip API is
+      needed. Works for local sessions too.
+    - Preview header (official slot `sidebar.right.tab.document.actions`, props
+      `{ absolutePath }`): 「@ 引用此文件」 inserts the workspace-relative path (forward
+      slashes; outside-cwd falls back to the readable remote/absolute form);
+      「引用选中段」 quotes the DOM selection as a fenced block with the file name and a
+      language tag (4000-char cap). Empty selection / no main session flash inline hints.
+    - Terminal: xterm selections live inside the canvas and the terminal package exposes no
+      action slot, so the PathLabel MutationObserver sweep also injects a small
+      「引用到对话」 float button into each `.xterm` (position:relative); clicking reads the
+      clipboard (covers every copy path: Ctrl+Shift+C / right-click) and inserts a quoted
+      terminal-output block.
+    - Smoke: +6 pure-function checks (relative reference inside/outside cwd, quote block
+      shape/empty/truncation). FORK.md 12's numbers still hold; client-only change, no build.
 
 ## Rebuild (after editing src/ — client/index.js needs no build)
 

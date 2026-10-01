@@ -176,11 +176,103 @@ window.__ModuleLoader__.load({
       }
       const sweep = () => {
         for (const el of document.querySelectorAll('span[data-path-label]')) rewrite(el)
+        ensureTerminalQuoteButtons()
       }
       sweep()
       const observer = new MutationObserver(() => sweep())
       observer.observe(document.body, { childList: true, subtree: true, characterData: true })
       return () => observer.disconnect()
+    }
+
+    /** 终端浮钮标记属性（去重用）。 */
+    const TERMINAL_QUOTE_BTN = 'data-dcw-quote-btn'
+
+    /** 按钮文案闪现（非 React 元素的轻量反馈）。 */
+    function flashButtonLabel(btn, message) {
+      const previous = btn.textContent
+      btn.textContent = message
+      setTimeout(() => { btn.textContent = previous }, 1500)
+    }
+
+    /**
+     * 终端浮钮「引用到对话」：xterm 的选区在 canvas 内部、无 DOM 选中可读，
+     * 且终端包没有动作插槽——往 .xterm（position:relative）注入一枚小浮钮，
+     * 点击读取**剪贴板**（用户先在终端选中并复制：Ctrl+Shift+C / 右键复制，
+     * 覆盖一切复制路径），作为带出处的终端输出引用块加入主会话草稿。
+     */
+    function ensureTerminalQuoteButtons() {
+      if (typeof document === 'undefined' || document.body === null || activeCtx === null) return
+      for (const term of document.querySelectorAll('.xterm')) {
+        if (term.querySelector(`[${TERMINAL_QUOTE_BTN}]`) !== null) continue
+        const btn = document.createElement('button')
+        btn.type = 'button'
+        btn.textContent = '引用到对话'
+        btn.setAttribute(TERMINAL_QUOTE_BTN, '')
+        btn.title = '把剪贴板内容作为终端输出引用加入对话（先在终端选中并复制：Ctrl+Shift+C 或右键复制）'
+        Object.assign(btn.style, {
+          position: 'absolute', top: '6px', right: '14px', zIndex: '30',
+          padding: '2px 10px', borderRadius: '8px', cursor: 'pointer',
+          fontSize: '11px', lineHeight: '18px',
+          border: '1px solid var(--dsw-alias-border-l2, rgba(0,0,0,0.12))',
+          background: 'color-mix(in srgb, var(--dsw-alias-bg-base, #fff) 85%, transparent)',
+          color: 'var(--dsw-alias-label-secondary, #6e6e73)', opacity: '0.6',
+        })
+        btn.addEventListener('mouseenter', () => { btn.style.opacity = '1' })
+        btn.addEventListener('mouseleave', () => { btn.style.opacity = '0.6' })
+        btn.addEventListener('click', async () => {
+          let text = ''
+          try { text = String(await navigator.clipboard.readText() || '') } catch { text = '' }
+          const block = quoteBlockFor('终端', text.trim())
+          if (block === null) { flashButtonLabel(btn, '剪贴板为空'); return }
+          if (!insertDraftText(activeCtx, block)) flashButtonLabel(btn, '未找到活动会话')
+          else flashButtonLabel(btn, '已加入对话 ✓')
+        })
+        term.appendChild(btn)
+      }
+    }
+
+    /** 主会话 cwd（@ 相对路径基准；失败返回 undefined）。 */
+    const mainCwdOf = () => {
+      try {
+        const row = mainSessionRow(activeCtx.get('sessions'))
+        return row === undefined ? undefined : row.cwd
+      } catch { return undefined }
+    }
+
+    /**
+     * 预览头动作（官方 sidebar.right.tab.document.actions 插槽，props 带
+     * absolutePath）：「@ 引用此文件」插工作区相对路径（composer 扫描自动
+     * 渲染成 chip）；「引用选中段」抓 window.getSelection 做围栏引用块。
+     */
+    function DocumentQuoteActions({ absolutePath }) {
+      const [flash, setFlash] = useState('')
+      useEffect(() => {
+        if (flash === '') return
+        const timer = setTimeout(() => setFlash(''), 1600)
+        return () => clearTimeout(timer)
+      }, [flash])
+      if (typeof absolutePath !== 'string' || absolutePath === '') return null
+      const name = absolutePath.split(/[\/\\]/).pop()
+      const insert = (payload, emptyHint) => {
+        if (payload === null) { setFlash(emptyHint); return }
+        setFlash(insertDraftText(activeCtx, payload) ? '已加入对话 ✓' : '未找到活动会话')
+      }
+      return h('span', { className: 'dri-quote-actions' },
+        flash === '' ? null : h('span', { className: 'dri-quote-flash' }, flash),
+        h('button', {
+          className: 'dri-btn dri-btn-mini', type: 'button',
+          title: `把 ${name} 作为 @ 文件引用加入对话输入框`,
+          onClick: () => insert(relativeReferenceFor(mainCwdOf(), absolutePath), '路径无效'),
+        }, '@ 引用此文件'),
+        h('button', {
+          className: 'dri-btn dri-btn-mini', type: 'button',
+          title: '把预览中选中的文本作为引用块加入对话（先拖选一段）',
+          onClick: () => {
+            const selection = typeof window.getSelection === 'function'
+              ? String(window.getSelection().toString()) : ''
+            insert(quoteBlockFor(name, selection), '先选中一段文本')
+          },
+        }, '引用选中段'))
     }
 
     /**
@@ -216,6 +308,100 @@ window.__ModuleLoader__.load({
       applyTitles()
       const unsubscribe = workspaces.list.subscribe(() => applyTitles())
       return () => { if (typeof unsubscribe === 'function') unsubscribe() }
+    }
+
+    // ------------------------------------------------- 快捷加内容到对话
+    // 官方 composer 的会话寻址面：sessions.scope(id).get('conversation')
+    // .input.for(actx) → shell（insertText/setDraft/notify/focus，均在
+    // ui-conversation 内部）。主会话 = retainedBy.mainView > 0 的行（与官方
+    // workspace UI 同款判定）。插入用纯文本追加（span=草稿末尾 + draftRev
+    // CAS），@path 文本会被 composer 的扫描自动渲染成 chip。
+
+    /** 主会话行（无主视图会话返回 undefined）。 */
+    function mainSessionRow(sessions) {
+      const byId = sessions && sessions.list && sessions.list.getSnapshot
+        ? sessions.list.getSnapshot().byId : undefined
+      const rows = Object.values(byId || {})
+      return rows.find((row) => row && ((row.retainedBy && row.retainedBy.mainView) ?? 0) > 0)
+    }
+
+    /**
+     * 把文本追加到主会话 composer 草稿末尾（不动已有内容/chip），成功后
+     * 焦点交还输入框。返回是否成功（失败仅 console 留痕，绝不抛出）。
+     */
+    function insertDraftText(ctx, text) {
+      try {
+        const sessions = ctx.get('sessions')
+        const row = mainSessionRow(sessions)
+        if (!sessions || !row) {
+          console.warn('[dsh-remote-ide] quote-to-conversation: no main session')
+          return false
+        }
+        const actx = sessions.scope(row.id)
+        const conversation = actx === undefined ? undefined : actx.get('conversation')
+        const input = conversation === undefined ? undefined : conversation.input
+        if (input === undefined || typeof input.for !== 'function') {
+          console.warn('[dsh-remote-ide] quote-to-conversation: conversation input unavailable')
+          return false
+        }
+        const shell = input.for(actx)
+        if (shell === undefined || typeof shell.insertText !== 'function') return false
+        const snapshot = shell.snapshot
+        const draft = (snapshot && typeof snapshot.draft === 'string') ? snapshot.draft : ''
+        const at = draft.length
+        const prefix = draft === '' || draft.endsWith('\n') ? '' : '\n'
+        const payload = prefix + text
+        let ok = false
+        try {
+          ok = shell.insertText(payload, { start: at, end: at, draftRev: snapshot.draftRev }) === true
+        } catch { ok = false }
+        if (!ok && typeof shell.setDraft === 'function') {
+          // rev 竞态兜底：整草稿重设（可能拍平已有 chip，仅极端时序发生）。
+          shell.setDraft(draft + payload)
+          ok = true
+        }
+        if (ok && typeof shell.focus === 'function') shell.focus()
+        return ok
+      } catch (error) {
+        console.error('[dsh-remote-ide] quote-to-conversation failed:', error)
+        return false
+      }
+    }
+
+    /** 纯 POSIX 风格 relative（不依赖 node:path；盘符大小写不敏感）。 */
+    function posixRelative(from, to) {
+      if (from === to) return ''
+      const a = from.split('/').filter((s) => s !== '')
+      const b = to.split('/').filter((s) => s !== '')
+      const same = (x, y) => x.toLowerCase() === y.toLowerCase()
+      let i = 0
+      while (i < a.length && i < b.length && same(a[i], b[i])) i += 1
+      if (i === 0 && /^[a-z]:$/i.test(a[0] ?? '') && !same(a[0], b[0] ?? '')) return null
+      const up = a.length - i
+      return (up > 0 ? Array(up).fill('..') : []).concat(b.slice(i)).join('/')
+    }
+
+    /** 绝对路径 → @ 引用文本：cwd 内取相对（正斜杠），否则远端可读形态。 */
+    function relativeReferenceFor(cwd, absolutePath) {
+      if (typeof absolutePath !== 'string' || absolutePath === '') return null
+      if (typeof cwd === 'string' && cwd !== '') {
+        const rel = posixRelative(cwd.replace(/\\/g, '/'), absolutePath.replace(/\\/g, '/'))
+        if (rel !== null && rel !== '' && !rel.startsWith('../')) return '@' + rel + ' '
+      }
+      const pretty = placeholderLabelFor(absolutePath)
+      return '@' + (pretty !== null ? pretty.remotePath : absolutePath.replace(/\\/g, '/')) + ' '
+    }
+
+    /** 选中文本 → 带出处的围栏引用块（超长截断；空文本返回 null）。 */
+    const QUOTE_MAX_CHARS = 4000
+    function quoteBlockFor(source, text) {
+      const body = String(text ?? '').replace(/\s+$/, '')
+      if (body === '') return null
+      const clipped = body.length > QUOTE_MAX_CHARS
+        ? body.slice(0, QUOTE_MAX_CHARS) + `\n…（已截断，原文 ${body.length} 字符）` : body
+      const langMatch = /\.(ts|tsx|js|jsx|py|sh|bash|zsh|json|ya?ml|toml|md|c|h|cpp|rs|go|java|sql)$/i.exec(source)
+      const lang = langMatch === null ? '' : langMatch[1].toLowerCase()
+      return `引用 \`${source}\`：\n\`\`\`${lang}\n${clipped}\n\`\`\`\n`
     }
 
     // --------------------------------------------------------------- store
@@ -347,6 +533,9 @@ window.__ModuleLoader__.load({
       .dri-pickerBody { display: flex; flex-direction: column; gap: 4px; }
       .dri-pickLocal { font-size: 14px; padding: 12px 18px; border-radius: 14px; align-self: flex-start; }
       .dri-pickerFoot { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--dsw-alias-border-l1, rgba(0,0,0,0.05)); }
+      .dri-quote-actions { display: inline-flex; align-items: center; gap: 6px; margin-left: 8px; }
+      .dri-quote-flash { font-size: 11px; color: var(--dsw-alias-state-success-primary, #1d9d6e); }
+      .dri-btn-mini { font-size: 11px; padding: 3px 10px; border-radius: 8px; }
     `
 
     // ---------------------------------------------------------- component
@@ -893,6 +1082,9 @@ window.__ModuleLoader__.load({
     /** apply() 注入给 WorkspacePicker 的动作集合（模块级，供闭包读取）。 */
     let pickerDeps = null
 
+    /** apply() 的 ctx（模块级，供 DOM 注入的终端浮钮等非 React 场景读取）。 */
+    let activeCtx = null
+
     function apply(ctx) {
       try {
         applyInner(ctx)
@@ -904,6 +1096,7 @@ window.__ModuleLoader__.load({
     }
 
     function applyInner(ctx) {
+      activeCtx = ctx
       const styleEl = document.createElement('style')
       styleEl.dataset.pluginCss = 'dsh-remote-ide/client'
       styleEl.textContent = CSS
@@ -1041,12 +1234,25 @@ window.__ModuleLoader__.load({
       } catch (error) {
         console.error('[dsh-remote-ide] workspace auto titles failed to start:', error)
       }
+
+      // 快捷加内容到对话：预览头动作插槽（官方 sidebar.right.tab.document.actions，
+      // props 带 absolutePath）。终端浮钮经上面的 MutationObserver sweep 注入。
+      // 注册失败不影响其他功能。
+      try {
+        ctx.slots.inject('sidebar.right.tab.document.actions', () => ctx.slots.register({
+          name: 'sidebar.right.tab.document.actions',
+          id: 'dsh-cloud-workspaces',
+          order: 50,
+        }, DocumentQuoteActions))
+      } catch (error) {
+        console.error('[dsh-remote-ide] document quote actions registration failed:', error)
+      }
     }
 
     // 'workspaces' 面不经 exports.inject 声明（loader 解析不了会连累整个
     // client 加载）；运行时面走 package.json dsh.client.inject 声明的
     // dsh-client-runtime，apply 内 ctx.get('workspaces') 防御式获取。
     // __test：纯函数面，供离线冒烟测试（node smoke-plugins.mjs）使用。
-    return { apply, inject: ['slots', 'connection', 'remote'], __test: { placeholderLabelFor } }
+    return { apply, inject: ['slots', 'connection', 'remote'], __test: { placeholderLabelFor, relativeReferenceFor, quoteBlockFor } }
   },
 })
