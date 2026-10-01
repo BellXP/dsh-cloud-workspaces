@@ -105,12 +105,14 @@ window.__ModuleLoader__.load({
 
     // ------------------------------------------------- 占位路径美化（标签）
     // 占位 cwd 形如 <home>\.dsh\remote\<hostId>\<base64url(remotePath)>；侧栏
-    // 文件树头部的 PathLabel 与工作区列表的 basename 回退会把它原样摆上界面
-    // （又长又不可读）。以下两件事都是**纯装饰性**的，不动任何路由键：
-    //  ① MutationObserver 把 PathLabel 文本改写为 hostId:/远端/路径；
+    // 文件树头部与文档预览头的 PathLabel、工作区列表的 basename 回退会把它
+    // 原样摆上界面（又长又不可读）。以下两件事都是**纯装饰性**的，不动任何
+    // 路由键：
+    //  ① MutationObserver 把 PathLabel 文本改写为 hostId:/远端/路径 —— 支持
+    //     编码段下的嵌套尾巴（文件预览头是 <占位根>\g15.sh 形态，v0.7.1）；
     //  ② 工作区 title 仍是自动派生 basename 时，经官方 workspaces.rename
     //     起个可读名（用户手动改过名的不碰，每个工作区只做一次）。
-    const PLACEHOLDER_PATH_RE = /[\/\\]\.dsh[\/\\]remote[\/\\]([^\/\\]+)[\/\\]([A-Za-z0-9_-]{4,})[\/\\]?$/
+    const PLACEHOLDER_PATH_RE = /[\/\\]\.dsh[\/\\]remote[\/\\]([^\/\\]+)[\/\\]([A-Za-z0-9_-]{4,})((?:[\/\\][^\/\\]+)*)[\/\\]?$/
 
     function decodeBase64Url(segment) {
       const b64 = segment.replace(/-/g, '+').replace(/_/g, '/')
@@ -122,7 +124,9 @@ window.__ModuleLoader__.load({
 
     /**
      * 占位符形状的本地路径 → 可读标签信息；不是占位路径（或解码不出合法
-     * POSIX 绝对路径）返回 null。纯函数，host/client/测试三处共用语义。
+     * POSIX 绝对路径）返回 null。支持编码段下的嵌套尾巴（目录/文件），tail
+     * 的分隔符统一为 "/"（文件预览头是 <占位根>\sub\g15.sh 形态）。纯函数，
+     * host/client/测试三处共用语义。
      */
     function placeholderLabelFor(path) {
       if (typeof path !== 'string') return null
@@ -131,6 +135,10 @@ window.__ModuleLoader__.load({
       let remotePath
       try { remotePath = decodeBase64Url(match[2]) } catch { return null }
       if (!remotePath.startsWith('/') || remotePath.indexOf('\0') !== -1) return null
+      const tail = match[3] === ''
+        ? ''
+        : match[3].split(/[\/\\]+/).filter(Boolean).join('/')
+      if (tail !== '') remotePath = remotePath + '/' + tail
       const cut = remotePath.lastIndexOf('/')
       const name = remotePath.slice(cut + 1)
       return {

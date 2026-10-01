@@ -118,13 +118,15 @@ applyable with `git apply` onto a fresh upstream clone). Summary of the changes:
       surface; the stale `setSettings`/`:memory:` fixtures in typert/http-proxy tests (broken since
       the settings-mirror retirement and illegal `:` in Windows filenames respectively) were fixed.
 10. **Feature: readable placeholder labels + seam cache/watch landing + BOM fix** (2026-10-01, v0.6.0):
-    - **Client: PathLabel rewrite** — the sidebar file-tree header renders the session cwd through
-      the official `PathLabel` (pure presentational, pathPartsOf → subdued directory + primary
-      name, `title` hover; no slot, no hook). A MutationObserver rewrites `span[data-path-label]`
-      elements whose title is placeholder-shaped (`…\.dsh\remote\<hostId>\<base64url>`) into
-      `MANote-W8-00:/home/ma-user/x00968307`. Purely cosmetic — the routing keys are untouched;
-      idempotent under React re-renders (it rewrites whatever React resets); only root-shaped
-      paths match, never nested tree rows.
+    - **Client: PathLabel rewrite** — the sidebar file-tree header AND the document-preview
+      header render paths through the official `PathLabel` (pure presentational, pathPartsOf →
+      subdued directory + primary name, `title` hover; no slot, no hook). A MutationObserver
+      rewrites `span[data-path-label]` elements whose title is placeholder-shaped
+      (`…\.dsh\remote\<hostId>\<base64url>[…\nested\tail]` — the nested tail landed in v0.7.1:
+      the file preview header carries `<placeholder root>\g15.sh`, which the root-only v0.6.0
+      regex missed) into `MANote-W8-00:/home/ma-user/x00968307[/sub/g15.sh]`. Purely cosmetic —
+      the routing keys are untouched; idempotent under React re-renders (it rewrites whatever
+      React resets).
     - **Client: workspace auto-titling** — the workspace list row shows `title ?? basename(cwd)`,
       and a fresh cloud workspace's basename is the base64url segment. When (and only when) the
       title is still the auto-derived basename, the client renames it via the OFFICIAL
