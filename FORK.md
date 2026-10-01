@@ -98,23 +98,52 @@ applyable with `git apply` onto a fresh upstream clone). Summary of the changes:
     - `grep`/`glob` shadow tools now probe on the session's persistent shell (same channel as `bash`,
       absolute paths, no cwd churn) instead of a fresh one-shot exec per call — saves the ~300 ms
       channel setup on every search; the 30 s timeout and one-shot-exec fallback semantics carry over.
-    - fs seam read-side **stat micro-cache** (2.5 s TTL per targetKey): the sidebar's
-      resolve→lstat→stat→read chain no longer pays a duplicate SFTP RTT per stat. Write guards still
-      go through the authoritative uncached `probe`, and writes invalidate the entry on commit.
-    - fs seam **pseudo-watch**: SFTP has no inotify, so `watch()` now polls an mtime/attrs
-      fingerprint (file = 1 RTT stat, directory = 1 RTT readdir) every 3 s and issues the
+    - fs **stat micro-cache** (2.5 s TTL, key = op+hostId+remotePath, missing paths negatively
+      cached): the sidebar's resolve→lstat→stat→read chain no longer pays a duplicate SFTP RTT per
+      stat. Built first in `src/fs-ssh.ts` (dormant preset path) — **ported onto the live seam in
+      v0.6.0** (see 10); this bullet originally overstated it as already seam-deployed.
+    - fs **pseudo-watch**: SFTP has no inotify, so `watch()` polls an mtime/attrs
+      fingerprint (file = 1 RTT lstat, directory = 1 RTT readdir) every 3 s and issues the
       content-free `changed()` invalidation — the sidebar file tree auto-follows agent edits
       instead of requiring manual refresh. Transient errors are tolerated (5 consecutive failures
       ≈ 15 s before the feed gives up and falls back to watch-unsupported behavior); ENOENT is a
-      fingerprint change, so create/delete events fire too. Declared without `override` because
-      the repo's 0.1.1-rc.2 devDeps typing has no `watch` on `FileSystem` (the 0.2.0 runtime base
-      class does; the method shadows it).
+      fingerprint change, so create/delete events fire too. Same history: built in `fs-ssh.ts`,
+      landed on the seam in v0.6.0 (the fs-ssh declaration keeps no `override` because the repo's
+      0.1.1-rc.2 devDeps typing has no `watch` on `FileSystem`; the seam mounts it as an
+      own-property duck patch instead).
     - Deferred: remote-aware terminal shell tab labels (`terminalEnvironment`/`resolveExecutable`
       carry no cwd, so global seam routing can't attribute them to a session; needs an agent-scope
       patch — see seam-terminal notes).
     - Tests repaired to 124/124: the three session-tool cases were re-based on the persistent-shell
       surface; the stale `setSettings`/`:memory:` fixtures in typert/http-proxy tests (broken since
       the settings-mirror retirement and illegal `:` in Windows filenames respectively) were fixed.
+10. **Feature: readable placeholder labels + seam cache/watch landing + BOM fix** (2026-10-01, v0.6.0):
+    - **Client: PathLabel rewrite** — the sidebar file-tree header renders the session cwd through
+      the official `PathLabel` (pure presentational, pathPartsOf → subdued directory + primary
+      name, `title` hover; no slot, no hook). A MutationObserver rewrites `span[data-path-label]`
+      elements whose title is placeholder-shaped (`…\.dsh\remote\<hostId>\<base64url>`) into
+      `MANote-W8-00:/home/ma-user/x00968307`. Purely cosmetic — the routing keys are untouched;
+      idempotent under React re-renders (it rewrites whatever React resets); only root-shaped
+      paths match, never nested tree rows.
+    - **Client: workspace auto-titling** — the workspace list row shows `title ?? basename(cwd)`,
+      and a fresh cloud workspace's basename is the base64url segment. When (and only when) the
+      title is still the auto-derived basename, the client renames it via the OFFICIAL
+      `workspaces.rename` to `主机 · 远端名` — once per workspaceId (localStorage ledger
+      `dsh.cloudWorkspaces.autoTitled`), never overriding user renames, failures not retried.
+    - **Host: seam cache + pseudo-watch actually deployed** — change 9's stat micro-cache and
+      fingerprint pseudo-watch ported from the dormant `fs-ssh.ts` onto `src/seam-fs.ts`: the
+      read chain (lstat/stat/streamText/readBytes prechecks) shares a 2.5 s TTL cache
+      (op-split keys, negative caching), and `watch()` polls a 3 s mtime/attrs fingerprint —
+      the sidebar tree now auto-refreshes on remote changes and degrades to manual refresh only
+      after 5 consecutive failures.
+    - **Fix: UTF-8 BOM in package.json** (v0.5.2) — a PowerShell write had left an EF BB BF BOM
+      that made dsh's profile loader fail `JSON.parse` and silently skip the WHOLE bundle (the
+      sidebar went local-looking AND the delete menu vanished, session-manager had the same
+      bug). Bytes verified to start with `0x7B`; a 53-check BOM/JSON guard now runs in the
+      workspace smoke test.
+    - Tests: 138/138 (13 new in `tests/seam-fs.test.ts`: cache hit/TTL/op-split/negative-cache/
+      passthrough/read-chain sharing; watch change/close/absent→present/dir-content/failure-limit/
+      local-unsupported; teardown restores prototype). tsc + tsdown + `test-built-lib.mjs` green.
 
 ## Rebuild (after editing src/ — client/index.js needs no build)
 
@@ -161,10 +190,13 @@ git stash pop      # resolve conflicts if upstream moved the same lines
 - No SSH host-key pinning (upstream limitation) — fine on a trusted intranet
 - Remote commands run with the SSH account's full rights (no dsh sandbox remotely)
 - Passwords/proxy credentials are plaintext in the 0600 store — prefer key auth
-- **Remote sidebar (seam) limits**: no `watch` on remote targets (file tree needs manual
-  refresh); remote path canonicalization is lexical (remote symlinks are not resolved into
-  distinct keys); the sidebar is read-only so no fs write methods are routed (agent writes go
-  through the shadow tools); terminal shell label may show the local shell name while the
-  remote login shell actually runs. If the fs/subprocess providers are ever reloaded via the
-  plugin manager, restart dsh web to re-arm the seams.
+- **Remote sidebar (seam) limits**: `watch` on remote targets is a 3 s fingerprint poll
+  (pseudo-watch, v0.6.0) — no native inotify, so sub-3 s remote changes surface on the next tick
+  and 5 consecutive failures degrade the tree to manual refresh; stat results are micro-cached
+  2.5 s (missing paths too), so a fresh view can be up to ~2.5 s behind a remote write; remote
+  path canonicalization is lexical (remote symlinks are not resolved into distinct keys); the
+  sidebar is read-only so no fs write methods are routed (agent writes go through the shadow
+  tools); terminal shell label may show the local shell name while the remote login shell
+  actually runs. If the fs/subprocess providers are ever reloaded via the plugin manager,
+  restart dsh web to re-arm the seams.
 - `.pnpm-store/` here is local build state; `node_modules/` regenerates via the rebuild steps

@@ -21,8 +21,9 @@
  * 契约要点（对照 workspaceFiles 实现核实）：
  * - stat/lstat 缺失路径返回 undefined（唯一 not-found 信号，绝不抛）；
  * - FS_NOT_TEXT / FS_TOO_LARGE 以 `.code` 字符串鸭子匹配（跨包不认类身份）；
- * - watch 对远端 target 抛 FsError → 官方 changes() 映射为
- *   workspace-file/watch-unsupported（侧边栏降级为手动刷新，是设计内行为）；
+ * - watch 对远端 target 走伪 watch（mtime/attrs 指纹轮询，content-free
+ *   changed()）；连续失败达上限才 changed(error) 自停 → 官方 changes()
+ *   映射为 workspace-file/watch-unsupported（侧边栏降级为手动刷新）；
  * - listDir 条目带 {name,type,target,size?}（version 会被 wire 层剥掉）。
  */
 
@@ -40,6 +41,16 @@ import { encodeRemotePath, mapLocalTreeToRemote, remoteRoot, resolveRemotePath }
 const STREAM_TEXT_MAX_BYTES = 33 * 1024 * 1024
 /** 文本 NUL 采样窗口（与 fs-ssh 一致）。 */
 const BINARY_SAMPLE_BYTES = 8192
+/** 读链 stat 微缓存 TTL（毫秒）：侧栏 resolve→lstat→stat→read 在数毫秒内
+ *  重复 stat 同一目标，远端每跳都是 SFTP RTT（与 fs-ssh 同款）。 */
+const STAT_CACHE_TTL_MS = 2500
+/** stat 微缓存容量上限（超限时先做过期清扫）。 */
+const STAT_CACHE_MAX_ENTRIES = 256
+/** 伪 watch 轮询间隔（毫秒）——SFTP 无 inotify，指纹轮询是唯一选择。 */
+const WATCH_POLL_MS = 3000
+/** 伪 watch 连续失败上限：达到即 changed(error) 上报并自停（订阅方回退
+ *  官方 watch-unsupported 行为）。 */
+const WATCH_FAILURE_LIMIT = 5
 
 /** ssh2 回调风格 → Promise（ssh2 的 err 形参是 `Error | undefined`）。 */
 function sftpCall<T>(invoke: (cb: (error: Error | undefined, value: T) => void) => void): Promise<T> {
@@ -170,6 +181,48 @@ export function installRemoteFsSeam(ctx: Context, runtime: SshRuntime, enabled: 
     const sftpFor = (hostId: string): Promise<SFTPWrapper> =>
       runtime.getConnectionFor(hostId).then(connection => connection.getSftp())
 
+    // ------------------------------------------------------- stat 微缓存
+    // 键 = <op>:<hostId>:<remotePath>（lstat 与 stat 的符号链接语义不同，
+    // 分开缓存；undefined = 负缓存，同样享受 TTL）。
+    const statCache = new Map<string, { expires: number; info: FsPathInfo | FsInfo | undefined }>()
+    const fetchStatInfo = (
+      op: 'stat' | 'lstat',
+      route: { hostId: string; remotePath: string },
+      displayPath: string,
+    ): Promise<FsPathInfo | FsInfo | undefined> => {
+      const key = `${op}:${route.hostId}:${route.remotePath}`
+      const now = Date.now()
+      const hit = statCache.get(key)
+      if (hit !== undefined && hit.expires > now) return Promise.resolve(hit.info)
+      if (statCache.size >= STAT_CACHE_MAX_ENTRIES) {
+        for (const [k, v] of statCache) if (v.expires <= now) statCache.delete(k)
+      }
+      const fetch = (async () => {
+        try {
+          const sftp = await sftpFor(route.hostId)
+          const stats = await sftpCall<SftpStats>(cb =>
+            op === 'lstat' ? sftp.lstat(route.remotePath, cb) : sftp.stat(route.remotePath, cb))
+          debugLog(`fs seam ${op}: ${route.hostId}:${route.remotePath} ok`)
+          return {
+            version: versionOf(route.remotePath, stats),
+            type: typeOf(stats, op === 'lstat'),
+            ...(stats.isFile() ? { size: stats.size } : {}),
+          } as FsPathInfo
+        } catch (error) {
+          if (isMissingPath(error)) {
+            debugLog(`fs seam ${op}: ${route.hostId}:${route.remotePath} MISSING (${error instanceof Error ? error.message : String(error)})`)
+            return undefined
+          }
+          debugLog(`fs seam ${op}: ${route.hostId}:${route.remotePath} ERROR ${error instanceof Error ? error.message : String(error)}`)
+          throw wrapError(op, displayPath, error)
+        }
+      })()
+      return fetch.then(info => {
+        statCache.set(key, { expires: Date.now() + STAT_CACHE_TTL_MS, info })
+        return info
+      }, error => Promise.reject(error))
+    }
+
     const resolveRoute = routeFsPath
     const routeOfTarget = routeFsTarget
     const placeholderKeyOf = placeholderKeyFor
@@ -199,23 +252,7 @@ export function installRemoteFsSeam(ctx: Context, runtime: SshRuntime, enabled: 
       const route = resolveRoute(p, opts?.cwd)
       if (route === undefined) return original.lstat(p, opts, signal)
       signal?.throwIfAborted()
-      try {
-        const sftp = await sftpFor(route.hostId)
-        const stats = await sftpCall<SftpStats>(cb => sftp.lstat(route.remotePath, cb))
-        debugLog(`fs seam lstat: ${route.hostId}:${route.remotePath} ok`)
-        return {
-          version: versionOf(route.remotePath, stats),
-          type: typeOf(stats, true) as FsPathInfo['type'],
-          ...(stats.isFile() ? { size: stats.size } : {}),
-        }
-      } catch (error) {
-        if (isMissingPath(error)) {
-          debugLog(`fs seam lstat: ${route.hostId}:${route.remotePath} MISSING (${error instanceof Error ? error.message : String(error)})`)
-          return undefined
-        }
-        debugLog(`fs seam lstat: ${route.hostId}:${route.remotePath} ERROR ${error instanceof Error ? error.message : String(error)}`)
-        throw wrapError('lstat', p, error)
-      }
+      return fetchStatInfo('lstat', route, p)
     }
 
     // --------------------------------------------------------------- stat
@@ -225,23 +262,8 @@ export function installRemoteFsSeam(ctx: Context, runtime: SshRuntime, enabled: 
       const route = routeOfTarget(target)
       if (route === undefined) return original.stat(target, signal)
       signal?.throwIfAborted()
-      try {
-        const sftp = await sftpFor(route.hostId)
-        const stats = await sftpCall<SftpStats>(cb => sftp.stat(route.remotePath, cb))
-        debugLog(`fs seam stat: ${route.hostId}:${route.remotePath} ok`)
-        return {
-          version: versionOf(route.remotePath, stats),
-          type: typeOf(stats) as FsInfo['type'],
-          ...(stats.isFile() ? { size: stats.size } : {}),
-        }
-      } catch (error) {
-        if (isMissingPath(error)) {
-          debugLog(`fs seam stat: ${route.hostId}:${route.remotePath} MISSING (${error instanceof Error ? error.message : String(error)})`)
-          return undefined
-        }
-        debugLog(`fs seam stat: ${route.hostId}:${route.remotePath} ERROR ${error instanceof Error ? error.message : String(error)}`)
-        throw wrapError('stat', target.displayPath, error)
-      }
+      // op 'stat' 的 typeOf 不放行 symlink（allowSymlink=false），值域即 FsInfo。
+      return fetchStatInfo('stat', route, target.displayPath) as Promise<FsInfo | undefined>
     }
 
     // ------------------------------------------------------------- listDir
@@ -283,22 +305,17 @@ export function installRemoteFsSeam(ctx: Context, runtime: SshRuntime, enabled: 
       const route = routeOfTarget(target)
       if (route === undefined) return original.streamText(target, signal)
       signal?.throwIfAborted()
-      // 预检：缺失/非普通文件/超限（与本地后端错误码一致）。
-      let size: number | undefined
-      try {
-        const sftp = await sftpFor(route.hostId)
-        const stats = await sftpCall<SftpStats>(cb => sftp.stat(route.remotePath, cb))
-        if (!stats.isFile()) {
-          throw new FsError(`cannot read "${target.displayPath}": not a regular file`, 'FS_NOT_REGULAR_FILE')
-        }
-        size = stats.size
-      } catch (error) {
-        if (error instanceof FsError) throw error
-        if (isMissingPath(error)) throw new FsError(`cannot read "${target.displayPath}": not found`, 'FS_NOT_FOUND')
-        throw wrapError('stat', target.displayPath, error)
+      // 预检：缺失/非普通文件/超限（与本地后端错误码一致；走 stat 微缓存，
+      // 与侧栏树形 stat 共享同一跳 RTT）。
+      const info = await fetchStatInfo('stat', route, target.displayPath)
+      if (info === undefined) {
+        throw new FsError(`cannot read "${target.displayPath}": not found`, 'FS_NOT_FOUND')
       }
-      if (size !== undefined && size > STREAM_TEXT_MAX_BYTES) {
-        throw new FsError(`cannot read "${target.displayPath}": ${size} bytes exceeds the streaming limit`, 'FS_TOO_LARGE')
+      if (info.type !== 'file') {
+        throw new FsError(`cannot read "${target.displayPath}": not a regular file`, 'FS_NOT_REGULAR_FILE')
+      }
+      if (info.size !== undefined && info.size > STREAM_TEXT_MAX_BYTES) {
+        throw new FsError(`cannot read "${target.displayPath}": ${info.size} bytes exceeds the streaming limit`, 'FS_TOO_LARGE')
       }
       const sftp = await sftpFor(route.hostId)
       const displayPath = target.displayPath
@@ -352,15 +369,18 @@ export function installRemoteFsSeam(ctx: Context, runtime: SshRuntime, enabled: 
       const route = routeOfTarget(target)
       if (route === undefined) return original.readBytes(target, signal, maxBytes)
       signal?.throwIfAborted()
+      const info = await fetchStatInfo('stat', route, target.displayPath)
+      if (info === undefined) {
+        throw new FsError(`cannot read "${target.displayPath}": not found`, 'FS_NOT_FOUND')
+      }
+      if (info.type !== 'file') {
+        throw new FsError(`cannot read "${target.displayPath}": not a regular file`, 'FS_NOT_REGULAR_FILE')
+      }
+      if (info.size !== undefined && info.size > maxBytes) {
+        throw new FsError(`cannot read "${target.displayPath}": ${info.size} bytes exceeds the ${maxBytes}-byte limit`, 'FS_TOO_LARGE')
+      }
+      const sftp = await sftpFor(route.hostId)
       try {
-        const sftp = await sftpFor(route.hostId)
-        const stats = await sftpCall<SftpStats>(cb => sftp.stat(route.remotePath, cb))
-        if (!stats.isFile()) {
-          throw new FsError(`cannot read "${target.displayPath}": not a regular file`, 'FS_NOT_REGULAR_FILE')
-        }
-        if (stats.size > maxBytes) {
-          throw new FsError(`cannot read "${target.displayPath}": ${stats.size} bytes exceeds the ${maxBytes}-byte limit`, 'FS_TOO_LARGE')
-        }
         const buffer = await sftpCall<Buffer>(cb => sftp.readFile(route.remotePath, cb))
         signal?.throwIfAborted()
         if (buffer.byteLength > maxBytes) {
@@ -415,15 +435,76 @@ export function installRemoteFsSeam(ctx: Context, runtime: SshRuntime, enabled: 
 
     surface.watch = async (
       target: FsTarget,
-      _changed: (error?: Error) => void,
-      _signal: AbortSignal,
+      changed: (error?: Error) => void,
+      signal: AbortSignal,
     ): Promise<() => Promise<void>> => {
-      if (!enabled()) return original.watch === undefined ? unsupportedWatch() : original.watch(target, _changed, _signal)
+      if (!enabled()) return original.watch === undefined ? unsupportedWatch() : original.watch(target, changed, signal)
       const route = routeOfTarget(target)
-      if (route === undefined) return original.watch === undefined ? unsupportedWatch() : original.watch(target, _changed, _signal)
-      // SSH 底座不支持远端监听：抛错 → workspaceFiles 映射为官方
-      // workspace-file/watch-unsupported（侧边栏手动刷新，设计内降级）。
-      throw new FsError('SSH workspaces do not support filesystem watching', 'FS_IO_ERROR')
+      if (route === undefined) return original.watch === undefined ? unsupportedWatch() : original.watch(target, changed, signal)
+      // 伪 watch（与 fs-ssh 同款）：SFTP 无 inotify，用 mtime/attrs 指纹轮询
+      // 实现 content-free changed()。文件 = 1 RTT lstat 的 mtime+size；
+      // 目录 = 1 RTT readdir 的 name+mtime+size 拼接；ENOENT 也是指纹
+      // （观察创建/删除）。连续 WATCH_FAILURE_LIMIT 次失败才 changed(error)
+      // 上报并自停（订阅方回退官方 watch-unsupported 手动刷新行为）。
+      signal.throwIfAborted()
+      let timer: ReturnType<typeof setInterval> | undefined
+      let stopped = false
+      let baseline: string | undefined
+      let failures = 0
+
+      const stop = (): void => {
+        if (stopped) return
+        stopped = true
+        if (timer !== undefined) clearInterval(timer)
+      }
+
+      const fingerprint = async (): Promise<string> => {
+        const sftp = await sftpFor(route.hostId)
+        let stats: SftpStats
+        try {
+          stats = await sftpCall<SftpStats>(cb => sftp.lstat(route.remotePath, cb))
+        } catch (error) {
+          if (isMissingPath(error)) return 'absent'
+          throw error
+        }
+        if (typeOf(stats, true) !== 'directory') return `f:${String(stats.mtime)}:${String(stats.size)}`
+        const listed = await sftpCall<Array<{ filename: string; attrs: SftpStats }>>(cb => sftp.readdir(route.remotePath, cb))
+        return `d:${listed
+          .map(entry => `${entry.filename}:${String(entry.attrs.mtime)}:${String(entry.attrs.size)}`)
+          .sort()
+          .join('|')}`
+      }
+
+      const poll = async (): Promise<void> => {
+        if (stopped || signal.aborted) return
+        try {
+          const next = await fingerprint()
+          failures = 0
+          if (baseline !== undefined && next !== baseline) {
+            debugLog(`fs seam watch: ${route.hostId}:${route.remotePath} changed`)
+            changed()
+          }
+          baseline = next
+        } catch (error) {
+          if (signal.aborted || stopped) return
+          failures += 1
+          if (failures >= WATCH_FAILURE_LIMIT) {
+            stop()
+            debugLog(`fs seam watch: ${route.hostId}:${route.remotePath} giving up after ${failures} failures`)
+            changed(error instanceof Error ? error : new Error(String(error)))
+          }
+        }
+      }
+
+      // 初始化即观察就绪（契约：resolve 后 closeFn 才交还）。
+      baseline = await fingerprint()
+      if (signal.aborted) {
+        stop()
+        return async () => { stop() }
+      }
+      timer = setInterval(() => { void poll() }, WATCH_POLL_MS)
+      timer.unref?.()
+      return async () => { stop() }
     }
 
     debugLog('fs seam: remote routing installed (resolve/lstat/stat/listDir/streamText/readBytes/readByteRange/watch)')

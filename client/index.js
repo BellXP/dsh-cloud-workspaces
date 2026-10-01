@@ -103,6 +103,112 @@ window.__ModuleLoader__.load({
       return slug + '-' + n
     }
 
+    // ------------------------------------------------- 占位路径美化（标签）
+    // 占位 cwd 形如 <home>\.dsh\remote\<hostId>\<base64url(remotePath)>；侧栏
+    // 文件树头部的 PathLabel 与工作区列表的 basename 回退会把它原样摆上界面
+    // （又长又不可读）。以下两件事都是**纯装饰性**的，不动任何路由键：
+    //  ① MutationObserver 把 PathLabel 文本改写为 hostId:/远端/路径；
+    //  ② 工作区 title 仍是自动派生 basename 时，经官方 workspaces.rename
+    //     起个可读名（用户手动改过名的不碰，每个工作区只做一次）。
+    const PLACEHOLDER_PATH_RE = /[\/\\]\.dsh[\/\\]remote[\/\\]([^\/\\]+)[\/\\]([A-Za-z0-9_-]{4,})[\/\\]?$/
+
+    function decodeBase64Url(segment) {
+      const b64 = segment.replace(/-/g, '+').replace(/_/g, '/')
+      const pad = (4 - (b64.length % 4)) % 4
+      const binary = atob(b64 + '='.repeat(pad))
+      const bytes = Uint8Array.from(binary, (ch) => ch.charCodeAt(0))
+      return new TextDecoder().decode(bytes)
+    }
+
+    /**
+     * 占位符形状的本地路径 → 可读标签信息；不是占位路径（或解码不出合法
+     * POSIX 绝对路径）返回 null。纯函数，host/client/测试三处共用语义。
+     */
+    function placeholderLabelFor(path) {
+      if (typeof path !== 'string') return null
+      const match = PLACEHOLDER_PATH_RE.exec(path)
+      if (match === null) return null
+      let remotePath
+      try { remotePath = decodeBase64Url(match[2]) } catch { return null }
+      if (!remotePath.startsWith('/') || remotePath.indexOf('\0') !== -1) return null
+      const cut = remotePath.lastIndexOf('/')
+      const name = remotePath.slice(cut + 1)
+      return {
+        hostId: match[1],
+        remotePath,
+        directory: match[1] + ':' + remotePath.slice(0, cut + 1),
+        name,
+        title: match[1] + ' · ' + name,
+      }
+    }
+
+    /**
+     * ① PathLabel 文本改写：官方 PathLabel 是纯展示组件（pathPartsOf →
+     * 弱化目录 + 强调文件名 + title 悬停），无插槽无钩子；唯一稳妥的注入
+     * 点是 DOM 层——观察 span[data-path-label]，title 呈占位形状时把两个
+     * 内层 span 改写为 hostId:目录 / 远端名。React 重渲会重置文本，观察
+     * 器随之重写（幂等：已是自己写的内容则跳过）。
+     */
+    function startPrettyPathLabels() {
+      if (typeof MutationObserver === 'undefined' || !document.body) return () => {}
+      const rewrite = (el) => {
+        if (el.textContent === el.__dcwText) return // 已是本插件写的内容
+        const pretty = placeholderLabelFor(el.getAttribute('title') || '')
+        if (pretty === null) return
+        el.__dcwText = pretty.directory + pretty.name
+        el.setAttribute('title', pretty.directory + pretty.name)
+        const spans = el.querySelectorAll(':scope > span > span')
+        if (spans.length >= 2) {
+          spans[0].textContent = pretty.directory
+          spans[1].textContent = pretty.name
+        } else if (spans.length === 1) {
+          spans[0].textContent = pretty.directory + pretty.name
+        }
+      }
+      const sweep = () => {
+        for (const el of document.querySelectorAll('span[data-path-label]')) rewrite(el)
+      }
+      sweep()
+      const observer = new MutationObserver(() => sweep())
+      observer.observe(document.body, { childList: true, subtree: true, characterData: true })
+      return () => observer.disconnect()
+    }
+
+    /**
+     * ② 工作区自动起名：官方列表行的显示优先级是 title ?? basename(cwd)。
+     * 占位工作区创建时官方只拿到本地路径，basename 是 base64url 段——对它
+     * 自动 rename 为「主机 · 远端名」。仅当 title 缺省/等于该 basename 时
+     * 执行（用户自定义名绝不覆盖），且每个 workspaceId 只做一次（localStorage
+     * 记账；rename 失败也不重试）。
+     */
+    function startAutoWorkspaceTitles(ctx) {
+      let workspaces
+      try { workspaces = ctx.get('workspaces') } catch { return undefined }
+      if (!workspaces || typeof workspaces.rename !== 'function'
+        || !workspaces.list || typeof workspaces.list.getSnapshot !== 'function') return undefined
+      const STORAGE_KEY = 'dsh.cloudWorkspaces.autoTitled'
+      let done = new Set()
+      try { done = new Set(JSON.parse(window.localStorage.getItem(STORAGE_KEY) || '[]')) } catch { done = new Set() }
+      const applyTitles = () => {
+        let snap
+        try { snap = workspaces.list.getSnapshot() } catch { return }
+        for (const item of (snap && snap.items) || []) {
+          if (!item || item.workspaceId === undefined || done.has(item.workspaceId)) continue
+          const pretty = placeholderLabelFor(item.path || '')
+          if (pretty === null) continue
+          const base = String(item.path || '').split(/[\/\\]/).pop()
+          if (item.title !== undefined && item.title !== '' && item.title !== base) continue // 用户自定义过
+          done.add(item.workspaceId)
+          try { window.localStorage.setItem(STORAGE_KEY, JSON.stringify([...done])) } catch { /* 仅内存去重 */ }
+          Promise.resolve(workspaces.rename(item.workspaceId, pretty.title))
+            .catch((error) => console.error('[dsh-remote-ide] workspace auto-title failed:', error))
+        }
+      }
+      applyTitles()
+      const unsubscribe = workspaces.list.subscribe(() => applyTitles())
+      return () => { if (typeof unsubscribe === 'function') unsubscribe() }
+    }
+
     // --------------------------------------------------------------- store
 
     function createStore() {
@@ -897,11 +1003,25 @@ window.__ModuleLoader__.load({
         window.addEventListener('error', onError)
         return () => window.removeEventListener('error', onError)
       }, 'dsh-remote-ide: window error log')
+
+      // 占位路径美化（纯装饰）：①PathLabel 文本改写 ②工作区自动起名。
+      // 各自独立失败隔离——任何一步异常都不拖垮设置卡与选择器。
+      try {
+        ctx.effect(() => startPrettyPathLabels(), 'dsh-remote-ide: pretty path labels')
+      } catch (error) {
+        console.error('[dsh-remote-ide] pretty path labels failed to start:', error)
+      }
+      try {
+        ctx.effect(() => startAutoWorkspaceTitles(ctx) || (() => {}), 'dsh-remote-ide: workspace auto titles')
+      } catch (error) {
+        console.error('[dsh-remote-ide] workspace auto titles failed to start:', error)
+      }
     }
 
     // 'workspaces' 面不经 exports.inject 声明（loader 解析不了会连累整个
     // client 加载）；运行时面走 package.json dsh.client.inject 声明的
     // dsh-client-runtime，apply 内 ctx.get('workspaces') 防御式获取。
-    return { apply, inject: ['slots', 'connection', 'remote'] }
+    // __test：纯函数面，供离线冒烟测试（node smoke-plugins.mjs）使用。
+    return { apply, inject: ['slots', 'connection', 'remote'], __test: { placeholderLabelFor } }
   },
 })
