@@ -215,6 +215,25 @@ applyable with `git apply` onto a fresh upstream clone). Summary of the changes:
       terminal-output block.
     - Smoke: +6 pure-function checks (relative reference inside/outside cwd, quote block
       shape/empty/truncation). FORK.md 12's numbers still hold; client-only change, no build.
+15. **Tooling: dsh 契约探针（升级雷达）+ OS 泛化审计** (2026-10-01, v0.9.1):
+    - `scripts/check-dsh-contract.mjs` — 逐条探测本插件依赖的每个 dsh 表面并**按名字**报断开：
+      host 侧真实加载包（defineTool 的 presentationMeta/presentCall 包装、**ToolRuntime 全链路
+      执行结果携带 meta.diffs**——v0.7.0 修复的那条契约、dsh-fs 导出面、SubprocessRuntime、
+      bindTypertRemote、四个 peer 可解析），client 侧对 dist 做字符串契约探测（7 个插槽名、
+      edit/write 行按名分发、结算态 meta.diffs、workspaces.rename、retainedBy.mainView、
+      input.for、insertText+draftRev、sessions scope/byId、PathLabel、dsh-subprocess-local 的
+      spawnTerminal）。用法：无参 = 查本仓库 devDeps（client 包记 SKIP）；传参 =
+      `node scripts/check-dsh-contract.mjs <完整dsh树/@deepseek-ai>` 升级前预检（对 0.1.1 与
+      0.2.0 两棵树各 30/30 通过）。`tests/dsh-contract.test.ts` 挂进 pnpm test——升级 devDeps
+      即红绿可见。工作区总冒烟 smoke-plugins.mjs 也串了三仓库的探针。
+    - OS 泛化审计结论：代码已按「本机路径 node:path / 远端路径 posix」双轨设计——Windows 专属
+      代码仅 `store.ts tightenWindowsAcl`（`process.platform==='win32'` 守卫）与开发用
+      `start-dsh-web.ps1`；client 端正则全部双分隔符（`[\/\\]`）。POSIX 真机验证路径（待执行，
+      MANote-W8-00 node v20.18 低于 engines ≥22.19，需 ≥22.19 的 Linux/Mac 环境）：
+      `git clone && npm install --legacy-peer-deps && npx vitest run && node scripts/check-dsh-contract.mjs <dsh树>`。
+    - session-manager 同款探针（8 契约，含 **projectKey 实测锚点**：用磁盘上观察到的真实目录名
+      锁死编码重实现，dsh 改算法时先红）；lib/index.js 增 `export const __test = { projectKey,
+      encodeSegment }` 测试面。solarized 同款（4 契约：设置插槽 + 主题注册面 + token 词汇）。
 
 ## Rebuild (after editing src/ — client/index.js needs no build)
 
