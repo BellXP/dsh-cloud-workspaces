@@ -56,7 +56,7 @@ window.__ModuleLoader__.load({
         result: { mode: 'src-json' },
       }
     }
-    const PARAM_NAMES = ['id', 'patch', 'hostId', 'cfg', 'path', 'remotePath']
+    const PARAM_NAMES = ['id', 'patch', 'hostId', 'cfg', 'path', 'remotePath', 'update']
     const CLIENT_TYPERT_REMOTE = {
       package: REMOTE_PACKAGE,
       schemas: PARAM_NAMES.map((name) => ({ name, create: () => PASSTHROUGH_SCHEMA })),
@@ -70,6 +70,7 @@ window.__ModuleLoader__.load({
         desc('removeRemote', ['hostId', 'path'], 'RemoveRemoteResult'),
         desc('createPlaceholder', ['hostId', 'remotePath'], 'CreatePlaceholderResult'),
         desc('listPlaceholders', [], 'ListPlaceholdersResult'),
+        desc('importHosts', ['update'], 'ImportHostsResult'),
         desc('refreshLoginEnv', ['hostId'], 'RefreshLoginEnvResult'),
       ],
     }
@@ -689,12 +690,19 @@ window.__ModuleLoader__.load({
 
     /** 设置页区块：主机列表 + 添加/编辑 + 远端目录 → 工作区。 */
     function SshHostsSection(props) {
-      const { useSshHosts, load, saveHost, deleteHost, testConnection, listRemoteDir, mkdirRemote, removeRemote, createPlaceholder, reloadPlaceholders } = props
+      const { useSshHosts, load, saveHost, deleteHost, testConnection, importHosts, listRemoteDir, mkdirRemote, removeRemote, createPlaceholder, reloadPlaceholders } = props
       const state = useSshHosts((snap) => snap)
       const [editing, setEditing] = useState(null)
       const [pendingDelete, setPendingDelete] = useState(null)
+      const [syncing, setSyncing] = useState(false)
+      const [notice, setNotice] = useState('')
 
       useEffect(() => { void load() }, [load])
+      useEffect(() => {
+        if (!notice) return
+        const timer = setTimeout(() => setNotice(''), 12000)
+        return () => clearTimeout(timer)
+      }, [notice])
 
       if (state.status === 'error') {
         return h('div', { className: 'dri-section' },
@@ -703,6 +711,31 @@ window.__ModuleLoader__.load({
       }
       const hosts = Object.values(state.hosts)
 
+      // 从 DSH 所在机器的 ~/.ssh/config 导入/同步：新增 Host 块，并按文件刷新
+      // 已导入的主机（端口/用户/密钥/ProxyJump/HTTP 代理），手动添加的不动。
+      const syncFromSshConfig = async () => {
+        if (syncing || !importHosts) return
+        setSyncing(true)
+        try {
+          const res = await importHosts(true)
+          const value = unwrap(res, null)
+          if (!value) setNotice('同步失败：' + resError(res, '无法读取 ~/.ssh/config'))
+          else {
+            const parts = []
+            if (value.added) parts.push(`新增 ${value.added} 台`)
+            if (value.updated) parts.push(`更新 ${value.updated} 台`)
+            if (!value.added && !value.updated) parts.push('已是最新')
+            parts.push(`（共解析 ${value.parsed} 个 Host 块）`)
+            if (value.updatedNames && value.updatedNames.length) parts.push('更新：' + value.updatedNames.join(', '))
+            setNotice(parts.join(' '))
+            await load()
+          }
+        } catch (error) {
+          setNotice('同步失败：' + String((error && error.message) || error))
+        }
+        setSyncing(false)
+      }
+
       return h('div', { className: 'dri-section' },
         h('h2', null, 'SSH 连接'),
         h('p', { className: 'dri-intro' },
@@ -710,7 +743,10 @@ window.__ModuleLoader__.load({
         h('div', { className: 'dri-head' },
           state.error ? h('p', { className: 'dri-error', role: 'alert' }, state.error) : null,
           h('span', null),
+          h('button', { className: 'dri-btn', disabled: syncing || !importHosts, onClick: syncFromSshConfig, title: '读取 DSH 所在机器的 ~/.ssh/config：新增 Host，并按文件刷新已导入的主机（含 ncat/connect HTTP 代理与 ProxyJump）' },
+            syncing ? '同步中…' : '从 ~/.ssh/config 导入 / 同步'),
           h('button', { className: 'dri-btn dri-btn-primary', onClick: () => setEditing({ mode: 'create' }) }, '+ 添加主机')),
+        notice ? h('p', { className: 'dri-hint', role: 'status', style: { marginTop: 6 } }, notice) : null,
 
         hosts.length === 0
           ? h('div', { className: 'dri-empty' }, '还没有配置主机。', h('br', null), '点击「+ 添加主机」开始。')
@@ -871,6 +907,19 @@ window.__ModuleLoader__.load({
             h('option', { value: '' }, '选择主机…'),
             hosts.map((host) => h('option', { key: host.id, value: host.id }, host.name || host.id)))),
         browser ? h('div', null,
+          h('div', { className: 'dri-dirActions', style: { marginTop: 8 } },
+            h('input', {
+              className: 'dri-newDir', defaultValue: '', placeholder: '输入远端路径直接跳转，如 /xupeng/cdl', 'aria-label': '远端路径',
+              onKeyDown: (e) => {
+                if (e.key !== 'Enter') return
+                e.preventDefault()
+                const raw = e.target.value.trim()
+                if (!raw || !browser) return
+                const abs = raw.startsWith('/') ? raw : '/' + raw
+                void browseTo(browser.hostId, abs)
+              },
+            }),
+            h('button', { className: 'dri-btn', onClick: () => browser && void browseTo(browser.hostId, browser.path), title: '重新读取当前目录' }, '↻')),
           h('div', { className: 'dri-dirPath' }, '当前目录：' + browser.path),
           h('div', { className: 'dri-dirList' }, ...dirRows),
           h('div', { className: 'dri-dirActions' },
@@ -921,6 +970,8 @@ window.__ModuleLoader__.load({
       const [tab, setTab] = useState('cloud')
       const [localBusy, setLocalBusy] = useState(false)
       const [browser, setBrowser] = useState(null)
+      const [pathInput, setPathInput] = useState('')
+      const [filter, setFilter] = useState('')
       const [newDir, setNewDir] = useState('')
       const [creating, setCreating] = useState(false)
       const [addingHost, setAddingHost] = useState(false)
@@ -955,16 +1006,43 @@ window.__ModuleLoader__.load({
 
       const browseTo = async (hostId, nextPath) => {
         const my = ++seq.current
+        setPathInput(nextPath)
+        setFilter('')
         setBrowser({ hostId, path: nextPath, entries: [], loading: true })
         try {
           const res = await withTimeout(deps.listRemoteDir(hostId, nextPath), 20_000, '读取远端目录')
           if (my !== seq.current) return
-          setBrowser({ hostId, path: nextPath, entries: unwrap(res, []) || [], loading: false })
+          const value = unwrap(res, null)
+          if (!Array.isArray(value)) {
+            // 到达了主机但结果形状不对 / 业务失败：把原因留在面板里，而不是只弹一下。
+            setBrowser({ hostId, path: nextPath, entries: [], loading: false, error: resError(res, '读取远端目录失败：返回了非列表结果') })
+            return
+          }
+          setBrowser({ hostId, path: nextPath, entries: value, loading: false })
         } catch (error) {
           if (my !== seq.current) return
-          setBrowser({ hostId, path: nextPath, entries: [], loading: false })
-          onError && onError(String((error && error.message) || error))
+          const message = String((error && error.message) || error)
+          setBrowser({ hostId, path: nextPath, entries: [], loading: false, error: message })
+          onError && onError(message)
         }
+      }
+
+      /** 把输入框里的路径规范成绝对 POSIX 路径（~ 不展开，交给远端 shell 语义之外的手动输入）。 */
+      const normalizeRemotePath = (raw) => {
+        const trimmed = String(raw || '').trim()
+        if (trimmed === '') return '/'
+        const withSlash = trimmed.startsWith('/') ? trimmed : '/' + trimmed
+        const parts = []
+        for (const seg of withSlash.split('/')) {
+          if (seg === '' || seg === '.') continue
+          if (seg === '..') parts.pop()
+          else parts.push(seg)
+        }
+        return '/' + parts.join('/')
+      }
+      const jumpToInput = () => {
+        if (!browser) return
+        void browseTo(browser.hostId, normalizeRemotePath(pathInput))
       }
 
       const createDir = async () => {
@@ -995,6 +1073,7 @@ window.__ModuleLoader__.load({
       }
 
       const dirRows = []
+      const filterText = filter.trim().toLowerCase()
       if (browser) {
         if (browser.path !== '/') {
           dirRows.push(h('div', { key: '..', className: 'dri-dirRow', onClick: () => {
@@ -1002,16 +1081,17 @@ window.__ModuleLoader__.load({
             void browseTo(browser.hostId, parent)
           } }, h('span', null, '..')))
         }
-        for (const e of browser.entries || []) {
-          if (e.type === 'dir') {
-            dirRows.push(h('div', { key: e.name, className: 'dri-dirRow', onClick: () => {
-              const next = (browser.path === '/' ? '' : browser.path) + '/' + e.name
-              void browseTo(browser.hostId, next)
-            } },
-              h('span', null, h('span', { className: 'dri-dirIcon' }, '›'), e.name)))
-          }
+        const dirs = (browser.entries || []).filter((e) => e.type === 'dir')
+        const shown = filterText ? dirs.filter((e) => e.name.toLowerCase().includes(filterText)) : dirs
+        for (const e of shown) {
+          dirRows.push(h('div', { key: e.name, className: 'dri-dirRow', onClick: () => {
+            const next = (browser.path === '/' ? '' : browser.path) + '/' + e.name
+            void browseTo(browser.hostId, next)
+          } },
+            h('span', null, h('span', { className: 'dri-dirIcon' }, '›'), e.name)))
         }
         if (browser.loading) dirRows.push(h('div', { key: 'loading', className: 'dri-dirRow', style: { cursor: 'default' } }, '连接中…'))
+        else if (!browser.error && shown.length === 0) dirRows.push(h('div', { key: 'empty', className: 'dri-dirRow', style: { cursor: 'default' } }, dirs.length === 0 ? '（此目录下没有子目录）' : '（没有匹配的目录）'))
       }
 
       const tabBtn = (id, label) => h('button', {
@@ -1031,6 +1111,17 @@ window.__ModuleLoader__.load({
         hostList.length === 0 ? h('span', { className: 'dri-hint' }, '还没有主机。') : null,
         h('button', { className: 'dri-btn', style: { alignSelf: 'flex-start', marginTop: 6 }, onClick: () => setAddingHost(!addingHost) },
           addingHost ? '收起' : '+ 添加主机'),
+        h('button', { className: 'dri-btn', style: { alignSelf: 'flex-start', marginTop: 6 }, title: '读取 DSH 所在机器的 ~/.ssh/config：新增 Host 并按文件刷新已导入主机（含代理）', onClick: async () => {
+          if (!deps.importHosts) return
+          try {
+            const res = await deps.importHosts(true)
+            const value = unwrap(res, null)
+            if (value) { if (deps.load) await deps.load(); onError && onError(value.added || value.updated ? `已从 ~/.ssh/config 同步：新增 ${value.added}，更新 ${value.updated}` : '~/.ssh/config 没有变化') }
+            else onError && onError(resError(res, '同步 ~/.ssh/config 失败'))
+          } catch (error) {
+            onError && onError(String((error && error.message) || error))
+          }
+        } }, '从 ~/.ssh/config 导入 / 同步'),
       )
 
       return h('div', { className: 'dri-pickerOverlay', role: 'dialog', 'aria-label': '选择工作区' },
@@ -1061,7 +1152,22 @@ window.__ModuleLoader__.load({
                     })
                   : hostSelect,
                 browser ? h('div', null,
+                  h('div', { className: 'dri-dirActions', style: { marginTop: 8 } },
+                    h('input', {
+                      className: 'dri-newDir', value: pathInput, placeholder: '输入远端路径直接跳转，如 /xupeng/cdl', 'aria-label': '远端路径',
+                      onChange: (e) => setPathInput(e.target.value),
+                      onKeyDown: (e) => { if (e.key === 'Enter') { e.preventDefault(); jumpToInput() } },
+                    }),
+                    h('button', { className: 'dri-btn', onClick: jumpToInput }, '跳转'),
+                    h('button', { className: 'dri-btn', title: '重新读取当前目录', onClick: () => browser && void browseTo(browser.hostId, browser.path) }, '↻')),
+                  h('div', { className: 'dri-dirActions', style: { marginTop: 6 } },
+                    h('input', {
+                      className: 'dri-newDir', value: filter, placeholder: '过滤当前目录…', 'aria-label': '过滤目录',
+                      onChange: (e) => setFilter(e.target.value),
+                    }),
+                    h('span', { className: 'dri-hint' }, `${(browser.entries || []).filter((e) => e.type === 'dir').length} 个子目录`)),
                   h('div', { className: 'dri-dirPath' }, browser.path),
+                  browser.error ? h('p', { className: 'dri-error', role: 'alert', style: { margin: '4px 0' } }, browser.error) : null,
                   h('div', { className: 'dri-dirList', style: { maxHeight: 200 } }, ...dirRows),
                   h('div', { className: 'dri-dirActions' },
                     h('input', {
@@ -1162,6 +1268,7 @@ window.__ModuleLoader__.load({
       const mkdirRemote = (hostId, path) => svc().mkdirRemote(hostId, path)
       const removeRemote = (hostId, path) => svc().removeRemote(hostId, path)
       const createPlaceholder = (hostId, remotePath) => svc().createPlaceholder(hostId, remotePath)
+      const importHosts = (update) => svc().importHosts(update)
 
       ctx.effect(() => {
         const disposers = [ctx.remote.$on('settings/document-updated', () => { void refresh() })]
@@ -1170,7 +1277,7 @@ window.__ModuleLoader__.load({
 
       const injected = () => ({
         hooks: { sshHosts: { getSnapshot: store.getSnapshot, subscribe: store.subscribe } },
-        load, reloadPlaceholders, saveHost, deleteHost, testConnection,
+        load, reloadPlaceholders, saveHost, deleteHost, testConnection, importHosts,
         listRemoteDir, mkdirRemote, removeRemote, createPlaceholder,
       })
 
@@ -1198,6 +1305,7 @@ window.__ModuleLoader__.load({
         pickerDeps = {
           load,
           saveHost,
+          importHosts,
           listRemoteDir,
           mkdirRemote,
           createPlaceholder,

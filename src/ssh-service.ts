@@ -20,7 +20,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { SshEngine, quoteSh } from './engine'
 import type { SshExecChannel, ShellSession } from './engine'
-import type { ExecResult, LoginEnvRecord, RemoteDirEntry, RemoteFileContent, WorkspaceStatus } from './protocol'
+import type { ExecResult, ImportResult, LoginEnvRecord, RemoteDirEntry, RemoteFileContent, WorkspaceStatus } from './protocol'
 import type { HostPayload } from './protocol'
 import { HostStore } from './store'
 import { debugLog } from './debug-log'
@@ -361,9 +361,32 @@ export class SshRuntime extends Service {
     return this.engine_.removeHost(alias)
   }
 
-  /** 从 ~/.ssh/config 导入主机。 */
-  importSshConfig() {
-    return this.engine_.importSshConfig()
+  /**
+   * 从 DSH 所在机器的 ~/.ssh/config 导入/同步主机。`update` 为真时既有
+   * ssh-config 来源的条目也按文件刷新（代理/跳板/密钥/端口以文件为准，
+   * 描述/环境标签/登录环境快照保留），手动添加的条目不受影响。
+   */
+  importSshConfig(update?: boolean): ImportResult {
+    return this.engine_.importSshConfig({ update })
+  }
+
+  /**
+   * 把一个本地目录登记为 DSH 工作区（官方 WorkspaceRegistry.create），
+   * 让占位目录出现在工作区列表；registry 5 s 内未就绪或创建失败返回 false。
+   */
+  async registerWorkspace(localPath: string, title: string): Promise<boolean> {
+    try {
+      const registry = await Promise.race([
+        Promise.resolve(this.ctx.get('workspaceRegistry') as { create(path: string, title?: string): Promise<unknown> } | undefined),
+        new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 5_000)),
+      ])
+      if (registry === undefined || typeof registry.create !== 'function') return false
+      await registry.create(localPath, title)
+      return true
+    } catch (error) {
+      debugLog(`workspace registry create failed for ${localPath}: ${error instanceof Error ? error.message : String(error)}`)
+      return false
+    }
   }
 
   // -------------------------------------------------------------- internal

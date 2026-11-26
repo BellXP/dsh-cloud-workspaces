@@ -2,6 +2,17 @@
 
 All notable changes to `dsh-cloud-workspaces` are documented here.
 
+## [v0.10.4] — 2026-11-26
+
+### Added
+- **Manual `~/.ssh/config` import / sync.** `importSshConfig(text?, { update })` gains an update mode: besides adding new `Host` blocks it refreshes every existing entry that came from ssh config (tag `ssh-config`) in place — port, user, `IdentityFile`, `ProxyJump` and the HTTP proxy translated from a ncat/nc/connect `ProxyCommand` follow the file again (a proxy the file no longer declares is cleared), while description, environment label and the login-env snapshot are kept. Manually created entries are never touched. `ImportResult` reports `updated` / `updatedNames`. Surfaces: a **「从 ~/.ssh/config 导入 / 同步」** button in the SSH settings card and in the workspace picker (with an added/updated toast), `ssh_list { sync: true }` for the agent, and the typert invocation `importHosts(update)`.
+- `ssh_workspace action: 'register'` binds a remote directory **and** adds the placeholder to the DSH workspace list through the official `WorkspaceRegistry.create` (`SshRuntime.registerWorkspace`), so a cloud workspace can be created end-to-end from the agent.
+- Workspace picker: a remote-path input with **跳转** (Enter) so a deep path can be typed directly, a **filter** box for the current listing, a refresh button, sub-directory count, explicit empty states, and the list error rendered inline instead of only as a transient toast; a non-array `listRemoteDir` result is reported as an error. The settings-card directory browser gets the same path-jump input.
+- Host-side `typert listRemoteDir` logs entry counts, durations and failures to `~/.dsh/dsh-remote-ide-debug.log`, so a picker that shows nothing leaves a trace of why.
+
+### Fixed
+- `ssh_list` keeps auto-importing only while the store is empty (unchanged); its previous empty-store hint now matches the explicit `sync` option.
+
 ## [v0.10.3] — 2026-11-26
 
 ### Changed

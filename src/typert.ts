@@ -21,7 +21,7 @@ import type { InvocationDescriptor, TypertCodec } from '@deepseek-ai/dsh-typert-
 import type { TypertContribution } from '@deepseek-ai/dsh-typert-registry'
 import type { SshRuntime } from './ssh-service'
 import type { SshHostConfig } from './host-settings'
-import type { HostPayload } from './protocol'
+import type { HostPayload, ImportResult } from './protocol'
 import { createPlaceholderDir, listPlaceholders } from './workspace'
 import { jsonSafe } from './jsonsafe'
 import { debugLog } from './debug-log'
@@ -86,6 +86,7 @@ export const HOST_TYPERT_CONTRIBUTION: TypertContribution = {
     hostInvocation('removeRemote', ['hostId', 'path']),
     hostInvocation('createPlaceholder', ['hostId', 'remotePath']),
     hostInvocation('listPlaceholders', []),
+    hostInvocation('importHosts', ['update']),
     hostInvocation('refreshLoginEnv', ['hostId']),
   ],
   model: EMPTY_MODEL,
@@ -263,7 +264,22 @@ export class SshRemoteService extends Service {
 
   /** 列远端目录（工作区创建浏览；需主机已在 store，未保存先桥接）。 */
   async listRemoteDir(hostId: string, path: string): Promise<unknown> {
-    return jsonSafe(await this.runtime.engine.ls(hostId, path))
+    const started = Date.now()
+    try {
+      const entries = jsonSafe(await this.runtime.engine.ls(hostId, path))
+      debugLog(`typert listRemoteDir ${hostId}:${path} -> ${Array.isArray(entries) ? entries.length : typeof entries} entries in ${Date.now() - started} ms`)
+      return entries
+    } catch (error) {
+      debugLog(`typert listRemoteDir ${hostId}:${path} FAILED after ${Date.now() - started} ms: ${error instanceof Error ? error.message : String(error)}`)
+      throw error
+    }
+  }
+
+  /** 从 DSH 所在机器的 ~/.ssh/config 导入/同步主机（update=true 刷新既有 ssh-config 条目）。 */
+  async importHosts(update: boolean): Promise<ImportResult> {
+    const result = this.runtime.importSshConfig(update === true)
+    debugLog(`typert importHosts update=${update === true}: parsed=${result.parsed} added=${result.added} updated=${result.updated} skipped=${result.skipped}`)
+    return result
   }
 
   /** 在远端创建目录（递归创建父级）。 */

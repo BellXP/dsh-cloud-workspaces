@@ -102,6 +102,23 @@ describe('ssh_list 输出边界', () => {
     expect(rendered[0]?.text).toContain('设置')
   })
 
+  it('ssh_list sync=true：先按 ~/.ssh/config 刷新主机（update）再列出；不 sync 的非空库调用不导入', async () => {
+    let syncCalls = 0
+    let hosts = hostsFromStore().slice(0, 1)
+    const runtime = stubRuntime({ list: () => hosts })
+    ;(runtime as unknown as { importSshConfig: (update: boolean) => void }).importSshConfig = (update) => {
+      syncCalls += 1
+      expect(update).toBe(true)
+      hosts = hostsFromStore()
+    }
+    const tool = sshListTool(runtime)
+    const output = await tool.execute({ sync: true })
+    expect(syncCalls).toBe(1)
+    expect(output.total).toBe(2)
+    await tool.execute({})
+    expect(syncCalls).toBe(1)
+  })
+
   it('空 store 且 runtime 提供 importSshConfig 时自动从 ~/.ssh/config 导入一次；非空不再导入', async () => {
     let calls = 0
     let hosts: Array<Record<string, unknown>> = []

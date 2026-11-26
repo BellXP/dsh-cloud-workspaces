@@ -84,6 +84,7 @@ export function sshListTool(runtime: SshRuntime) {
       'Triggers: SSH, remote server, server IP/hostname, connect/login, check server/status, deploy, upload/download, jump host.',
     parameters: {
       query: { type: 'string', description: 'Optional fuzzy match against alias, description, host, and tags.' },
+      sync: { type: 'boolean', description: 'Re-read ~/.ssh/config on the DSH host first: new Host blocks are added, existing ssh-config-imported hosts are refreshed in place (port, user, IdentityFile, ProxyJump and the HTTP proxy from a ncat/nc/connect ProxyCommand follow the file). Manually added hosts are untouched.' },
     },
     output: {
       schema: {
@@ -124,7 +125,15 @@ export function sshListTool(runtime: SshRuntime) {
         return text(renderHosts(value.hosts))
       },
     },
-    async execute(args: { query?: string }) {
+    async execute(args: { query?: string; sync?: boolean }) {
+      // Explicit sync: ~/.ssh/config changed since the last import.
+      if (args.sync === true && typeof runtime.importSshConfig === 'function') {
+        try {
+          runtime.importSshConfig(true)
+        } catch {
+          /* fall through to the listing */
+        }
+      }
       // Empty store + an ~/.ssh/config on the DSH host: import it once, so the
       // agent-facing flow works without the settings card — the empty-list hint
       // above promises exactly this. Imported entries carry translated proxy
@@ -331,9 +340,10 @@ export function sshWorkspaceTool(runtime: SshRuntime) {
       '(file tools, search, editor and terminals all target it). Also lists existing placeholder workspaces. ' +
       'Triggers: use a server directory as workspace, work on /path/on/server, which workspace, set up remote workspace.',
     parameters: {
-      action: { type: 'string', enum: ['create', 'list'], description: 'create = bind a remote dir; list = show existing bindings.', required: true },
-      host: { type: 'string', description: 'Host alias from ssh_list (required for create).' },
-      path: { type: 'string', description: 'Absolute remote directory path, e.g. /home/user/project (required for create).' },
+      action: { type: 'string', enum: ['create', 'register', 'list'], description: 'create = bind a remote dir (placeholder only); register = bind AND add it to the DSH workspace list so it shows in the sidebar; list = show existing bindings.', required: true },
+      host: { type: 'string', description: 'Host alias from ssh_list (required for create/register).' },
+      path: { type: 'string', description: 'Absolute remote directory path, e.g. /home/user/project (required for create/register).' },
+      title: { type: 'string', description: 'Optional workspace title for register (default "<host> / <dirname>").' },
     },
     output: {
       schema: {
@@ -344,6 +354,8 @@ export function sshWorkspaceTool(runtime: SshRuntime) {
           localPath: { type: 'string' },
           host: { type: 'string' },
           remotePath: { type: 'string' },
+          title: { type: 'string' },
+          registered: { type: 'boolean' },
           workspaces: {
             type: 'array',
             items: {
@@ -367,10 +379,10 @@ export function sshWorkspaceTool(runtime: SshRuntime) {
           return text(['host | remotePath | localPath', '--- | --- | ---',
             ...value.workspaces.map(w => `${w.host} | ${w.remotePath} | ${w.localPath}`)].join('\n'))
         }
-        return text(`placeholder workspace ready:\n  host: ${value.host}\n  remote: ${value.remotePath}\n  local: ${value.localPath}\n${value.hint ?? ''}`)
+        return text(`placeholder workspace ready:\n  host: ${value.host}\n  remote: ${value.remotePath}\n  local: ${value.localPath}\n${value.action === 'register' ? `  workspace list: ${value.registered ? `added as "${value.title}"` : 'NOT added (workspace registry unavailable) — pick the local path in "select workspace" instead'}\n` : ''}${value.hint ?? ''}`)
       },
     },
-    async execute(args: { action: 'create' | 'list'; host?: string; path?: string }) {
+    async execute(args: { action: 'create' | 'register' | 'list'; host?: string; path?: string; title?: string }) {
       if (args.action === 'list') {
         const workspaces = await listPlaceholders()
         return jsonSafe({
@@ -387,13 +399,21 @@ export function sshWorkspaceTool(runtime: SshRuntime) {
         throw new Error('path must be an absolute remote directory path (e.g. /home/user/project)')
       }
       const created = await createPlaceholderDir({ hostId: alias, remotePath })
-      return jsonSafe({
-        action: 'create' as const,
+      const base = {
         localPath: created.localPath,
         host: created.hostId,
         remotePath: created.remotePath,
         hint: 'In the DSH UI use "select workspace" on this local path (or start a new session with it) — the session will run on the remote directory.',
-      })
+      }
+      if (args.action === 'register') {
+        const dirname = remotePath.split('/').filter(Boolean).pop() || 'root'
+        const title = args.title?.trim() || `${alias} / ${dirname}`
+        const registered = typeof runtime.registerWorkspace === 'function'
+          ? await runtime.registerWorkspace(created.localPath, title)
+          : false
+        return jsonSafe({ action: 'register' as const, ...base, title, registered })
+      }
+      return jsonSafe({ action: 'create' as const, ...base })
     },
   })
 }

@@ -405,18 +405,28 @@ export class HostStore {
    * `ProxyCommand` lines that are a recognised HTTP-proxy helper (ncat
    * `--proxy-type http`, `nc -X connect`, `connect -H`) become the entry's
    * native `httpProxy`; `ProxyJump` aliases that name an imported block
-   * become its jump chain. Returns counts per outcome.
+   * become its jump chain.
+   *
+   * Default (add mode): existing aliases are skipped. `update: true`
+   * additionally re-imports every existing entry that came from ssh config
+   * (tag `ssh-config`) in place — host/port/user/key path/jump chain/proxy
+   * follow the file again, so an edited ~/.ssh/config can be synced with one
+   * call; description/environment/login-env snapshot stay. Manually created
+   * entries are never touched by an import. Returns counts per outcome.
    */
-  importSshConfig(text?: string): ImportResult {
+  importSshConfig(text?: string, options?: { update?: boolean }): ImportResult {
     const source = text ?? readSshConfigFile()
     if (source === undefined) {
-      return { parsed: 0, added: 0, skipped: 0, skippedNames: [] }
+      return { parsed: 0, added: 0, updated: 0, skipped: 0, skippedNames: [] }
     }
+    const update = options?.update === true
     const blocks = parseSshConfig(source)
     const knownAliases = new Set(
       blocks.map((block) => block.name.trim()).filter((name) => name !== '' && !name.includes('*') && !name.includes('?')),
     )
     let added = 0
+    let updated = 0
+    const updatedNames: string[] = []
     const skippedNames: string[] = []
     for (const block of blocks) {
       // Multi-pattern Host stanzas are only safe to import when the block
@@ -426,11 +436,16 @@ export class HostStore {
         continue
       }
       const alias = block.name.trim()
-      if (alias === '' || this.entries.has(alias)) {
+      if (alias === '') {
         skippedNames.push(alias)
         continue
       }
-      this.upsert({
+      const existing = this.entries.get(alias)
+      if (existing !== undefined && !(update && existing.tags.includes('ssh-config'))) {
+        skippedNames.push(alias)
+        continue
+      }
+      const payload: HostPayload = {
         alias,
         host: block.hostName,
         port: block.port,
@@ -440,16 +455,24 @@ export class HostStore {
           keyPath: block.identityFile ?? '~/.ssh/id_ed25519',
         },
         proxyJump: proxyJumpFromValue(block.proxyJump, knownAliases),
-        httpProxy: httpProxyFromProxyCommand(block.proxyCommand ?? ''),
+        // `null` clears a proxy the config no longer declares (sync = file wins).
+        httpProxy: httpProxyFromProxyCommand(block.proxyCommand ?? '') ?? null,
         tags: ['ssh-config'],
-      }, undefined)
-      added += 1
+      }
+      this.upsert(payload, alias)
+      if (existing === undefined) added += 1
+      else {
+        updated += 1
+        updatedNames.push(alias)
+      }
     }
     return {
       parsed: blocks.length,
       added,
+      updated,
       skipped: skippedNames.length,
       skippedNames: skippedNames.slice(0, 50),
+      updatedNames: updatedNames.slice(0, 50),
     }
   }
 

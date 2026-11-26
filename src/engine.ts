@@ -582,8 +582,8 @@ export class SshEngine {
     return this.store.remove(alias)
   }
 
-  importSshConfig() {
-    return this.store.importSshConfig()
+  importSshConfig(options?: { update?: boolean }) {
+    return this.store.importSshConfig(undefined, options)
   }
 
   // ------------------------------------------------------------ connection

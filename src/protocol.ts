@@ -122,8 +122,12 @@ export interface HostPayload {
 export interface ImportResult {
   parsed: number
   added: number
+  /** Entries re-imported from ~/.ssh/config in place (update mode, ssh-config tagged only). */
+  updated: number
   skipped: number
   skippedNames: string[]
+  /** Aliases refreshed in update mode (for the UI toast). */
+  updatedNames?: string[]
 }
 
 /** Test-connection outcome. */

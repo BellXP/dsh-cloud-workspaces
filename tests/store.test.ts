@@ -252,4 +252,36 @@ describe('ssh-config proxy translation', () => {
     expect(second.skippedNames).toEqual(['a'])
     expect(store.get('a')!.httpProxy).toEqual({ host: 'p', port: 8080 })
   })
+
+  it('importSshConfig({ update: true }) 按文件刷新 ssh-config 条目（端口/密钥/代理/跳板跟随），手动条目与描述保留', () => {
+    const { store } = makeStore()
+    const v1 = [
+      'Host a', '  HostName 10.0.0.1', '  User root', '  Port 22', '  IdentityFile ~/.ssh/k1',
+      '  ProxyCommand ncat --proxy p:8080 --proxy-type http %h %p',
+      'Host b', '  HostName 10.0.0.2', '  User root',
+    ].join('\n')
+    store.importSshConfig(v1)
+    store.upsert({ alias: 'manual', host: '10.9.9.9', user: 'x', auth: { kind: 'password', password: 'p' } })
+    // A user-edited description on an imported host must survive a sync.
+    store.upsert({ alias: 'a', host: '10.0.0.1', user: 'root', description: 'prod box' }, 'a')
+    const v2 = [
+      'Host a', '  HostName 10.0.0.1', '  User root', '  Port 2222', '  IdentityFile ~/.ssh/k2',
+      'Host b', '  HostName 10.0.0.2', '  User root', '  ProxyJump a',
+      'Host c', '  HostName 10.0.0.3', '  User ubuntu',
+    ].join('\n')
+    const result = store.importSshConfig(v2, { update: true })
+    expect(result).toMatchObject({ parsed: 3, added: 1, updated: 2, skipped: 0 })
+    expect([...result.updatedNames!].sort()).toEqual(['a', 'b'])
+    const a = store.get('a')!
+    expect(a.port).toBe(2222)
+    expect(a.auth).toEqual({ kind: 'key', keyPath: '~/.ssh/k2' })
+    expect(a.httpProxy).toBeUndefined(), 'proxy no longer declared in the file is cleared'
+    expect(a.description).toBe('prod box')
+    expect(store.get('b')!.proxyJump).toEqual(['a'])
+    expect(store.get('c')!.host).toBe('10.0.0.3')
+    expect(store.get('manual')!.host).toBe('10.9.9.9')
+    // Add mode (no update) leaves existing entries untouched.
+    expect(store.importSshConfig(v1).updated).toBe(0)
+    expect(store.get('a')!.port).toBe(2222)
+  })
 })
