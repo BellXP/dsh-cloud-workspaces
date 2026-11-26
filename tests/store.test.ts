@@ -143,13 +143,18 @@ describe('ssh-config proxy translation', () => {
     const text = [
       'Host via-ncat',
       '  HostName 10.0.0.1',
+      '  IdentityFile "C:\\Users\\me\\.ssh\\id_ed25519"',
       '  ProxyCommand "C:\\Program Files (x86)\\Nmap\\ncat.exe" --proxy proxyspl.huawei.com:8080 --proxy-type http --proxy-auth "u:p" %h %p',
       'Host via-jump',
       '  HostName 10.0.0.2',
       '  ProxyJump bastion, extra',
     ].join('\n')
     const blocks = parseSshConfig(text)
+    // A value quoted as a whole loses its quotes (Windows paths with spaces);
+    // a ProxyCommand with only its program quoted keeps the inner quotes.
+    expect(blocks[0]!.identityFile).toBe('C:\\Users\\me\\.ssh\\id_ed25519')
     expect(blocks[0]!.proxyCommand).toContain('--proxy proxyspl.huawei.com:8080')
+    expect(blocks[0]!.proxyCommand).toMatch(/^"C:\\Program Files/)
     expect(blocks[1]!.proxyJump).toBe('bastion, extra')
   })
 

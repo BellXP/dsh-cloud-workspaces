@@ -102,6 +102,31 @@ describe('ssh_list 输出边界', () => {
     expect(rendered[0]?.text).toContain('设置')
   })
 
+  it('空 store 且 runtime 提供 importSshConfig 时自动从 ~/.ssh/config 导入一次；非空不再导入', async () => {
+    let calls = 0
+    let hosts: Array<Record<string, unknown>> = []
+    const runtime = stubRuntime({ list: () => hosts })
+    ;(runtime as unknown as { importSshConfig: () => void }).importSshConfig = () => {
+      calls += 1
+      hosts = hostsFromStore()
+    }
+    const tool = sshListTool(runtime)
+    const output = await tool.execute({})
+    expect(calls).toBe(1)
+    expect(output.total).toBe(2)
+    await tool.execute({})
+    expect(calls).toBe(1)
+  })
+
+  it('导入抛错不影响 ssh_list（退回空列表提示）', async () => {
+    const runtime = stubRuntime()
+    ;(runtime as unknown as { importSshConfig: () => void }).importSshConfig = () => {
+      throw new Error('boom')
+    }
+    const output = await sshListTool(runtime).execute({})
+    expect(output.total).toBe(0)
+  })
+
   it('render：过滤无匹配但 store 有主机时不再说 no hosts configured', () => {
     const tool = sshListTool(stubRuntime())
     const rendered = tool.output.render({ query: 'nomatch' }, { hosts: [], total: 2 } as never)

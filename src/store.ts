@@ -78,7 +78,11 @@ export function parseSshConfig(text: string): RawSshHostBlock[] {
     const match = /^([A-Za-z][A-Za-z0-9]*)\s+(.*)$/.exec(line)
     if (!match) continue
     const key = match[1]!.toLowerCase()
-    const value = match[2]!.trim()
+    // OpenSSH lets a value be wrapped in double quotes (common on Windows for
+    // paths with spaces, e.g. IdentityFile "C:\Users\me\.ssh\id_ed25519"); strip
+    // only a matching pair around the WHOLE value so a ProxyCommand whose
+    // program path alone is quoted keeps its inner quotes.
+    const value = match[2]!.trim().replace(/^"(.*)"$/, '$1')
 
     if (key === 'host') {
       // Flush the previous block.

@@ -2,6 +2,13 @@
 
 All notable changes to `dsh-cloud-workspaces` are documented here.
 
+## [v0.10.2] — 2026-11-26
+
+### Fixed
+- **`~/.ssh/config` values wrapped in double quotes are now unquoted on import.** `IdentityFile "C:\Users\me\.ssh\id_ed25519"` (the Windows form for paths with spaces) used to be stored with its quotes, so the engine looked for a file literally named `"…id_ed25519"` and every connection failed with `private key not found`. Only a matching pair around the whole value is stripped; a `ProxyCommand` whose program path alone is quoted keeps its inner quotes
+- `ssh_list` now really does what its hint promised: while the store is empty it imports `~/.ssh/config` from the DSH host first (with the v0.10.1 proxy translation), so the agent-facing flow works without the settings card; a failing import falls back to the empty-list hint
+- Verified live against `flex-0522-4-inter` through the corporate HTTP CONNECT proxy with the built engine: exec 1.0 s cold / 0.95 s warm, SFTP read ok
+
 ## [v0.10.1] — 2026-11-26
 
 ### Added

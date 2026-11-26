@@ -119,12 +119,23 @@ export function sshListTool(runtime: SshRuntime) {
           if (value.total > 0 && query !== '') {
             return text(`no hosts match query "${query}" — call ssh_list without query to see all ${value.total} host(s)`)
           }
-          return text('no hosts configured — ask the user to add one in the DSH settings panel (设置 → SSH 连接), or place an entry in ~/.ssh/config on the DSH host and call ssh_list again to import')
+          return text('no hosts configured — ask the user to add one in the DSH settings panel (设置 → SSH 连接), or place an entry in ~/.ssh/config on the DSH host: ssh_list imports it automatically while the store is empty')
         }
         return text(renderHosts(value.hosts))
       },
     },
     async execute(args: { query?: string }) {
+      // Empty store + an ~/.ssh/config on the DSH host: import it once, so the
+      // agent-facing flow works without the settings card — the empty-list hint
+      // above promises exactly this. Imported entries carry translated proxy
+      // settings (ncat/nc/connect HTTP proxies, ProxyJump), see store.ts.
+      if (runtime.engine.list().length === 0 && typeof runtime.importSshConfig === 'function') {
+        try {
+          runtime.importSshConfig()
+        } catch {
+          /* leave the empty-list hint in place */
+        }
+      }
       // createdAt/updatedAt 对模型无价值且 output schema 未声明
       // （additionalProperties: false 会拒绝）——显式剥离。
       const hosts = runtime.engine.list(args.query).map((host) => ({
