@@ -252,6 +252,9 @@ export function sshLsTool(runtime: SshRuntime) {
                 type: { type: 'string', enum: ['dir', 'file', 'other'], required: true },
                 size: { type: 'integer', required: true },
                 mtimeMs: { type: 'integer', required: true },
+                // Raw stat mode (engine.ls always sets it); optional in the
+                // shared entry type, so the schema keeps it optional too.
+                mode: { type: 'integer' },
               },
             },
           },

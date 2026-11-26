@@ -7,7 +7,7 @@
  */
 
 import { describe, expect, it, vi } from 'vitest'
-import { sshExecTool, sshListTool } from '../src/tools'
+import { sshExecTool, sshListTool, sshLsTool } from '../src/tools'
 import type { SshRuntime } from '../src/ssh-service'
 
 /** 轻量镜像 lossless-JSON 断言（同 dsh-session walkJsonValue 语义）。 */
@@ -150,6 +150,29 @@ describe('ssh_list 输出边界', () => {
     expect(rendered[0]?.text).toContain('no hosts match query')
     expect(rendered[0]?.text).toContain('2 host(s)')
     expect(rendered[0]?.text).not.toContain('no hosts configured')
+  })
+})
+
+describe('ssh_ls 输出边界', () => {
+  it('engine.ls 的条目带 mode：输出字段必须在 schema 中声明（mode 泄漏回归）', async () => {
+    // engine.ls 对每个条目都设置 stat mode（工作区选择器复用该字段）。
+    const entries = [
+      { name: 'src', type: 'dir', size: 4096, mtimeMs: 1788056122468, mode: 0o40755 },
+      { name: 'README.md', type: 'file', size: 12, mtimeMs: 1788056122468, mode: 0o100644 },
+    ]
+    const tool = sshLsTool(stubRuntime({ ls: async () => entries }))
+    const output = await tool.execute({ path: '/x' })
+    assertLosslessJson(output)
+    const schema = tool.output.schema as unknown as {
+      properties: { entries: { items: { properties: Record<string, unknown> } } }
+    }
+    const declared = new Set(Object.keys(schema.properties.entries.items.properties))
+    expect(declared.has('mode')).toBe(true)
+    for (const entry of output.entries) {
+      for (const key of Object.keys(entry)) {
+        expect(declared.has(key)).toBe(true)
+      }
+    }
   })
 })
 

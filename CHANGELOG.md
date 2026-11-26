@@ -2,6 +2,14 @@
 
 All notable changes to `dsh-cloud-workspaces` are documented here.
 
+## [v0.10.5] — 2026-11-26
+
+### Fixed
+- `ssh_ls` failed on every non-empty directory ("`value.entries[n].mode` is not a declared property"): `engine.ls` sets the stat `mode` on each entry (the workspace picker reads it), but the tool's output schema closes the entry object with `additionalProperties: false` and never declared the field. The schema now declares the optional `mode`, so the agent sees the permission bits the engine already returned.
+
+### Added
+- Test (+1, 182 total): an `ssh_ls` result built from `engine.ls`-shaped entries must have every key declared in the output schema.
+
 ## [v0.10.4] — 2026-11-26
 
 ### Added
