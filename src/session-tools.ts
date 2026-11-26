@@ -4,7 +4,8 @@
  * agent/created 钩子读会话 cwd：落在 ~/.dsh/remote/<hostId>/<b64> 下 → 在
  * agent scope 注册与官方同名的 bash / read / write / edit / glob / grep 遮蔽
  * 工具，execute 全部经共享 SshEngine 直接落在锚定主机上；配合 systemPrompt
- * 的动态段（按会话 cwd 求值）宣告远程身份。本地会话不注册任何东西，零影响。
+ * 的动态段（按会话 cwd 求值）宣告远程身份。遮蔽只替换会话组合已经提供的同名
+ * 工具（见 selectShadowTools），不给只读组合补写工具。本地会话不注册任何东西，零影响。
  *
  * 设计约束：
  * - 参数名与官方 tool-fs / tool-bash 对齐（file_path / content / pattern /
@@ -607,7 +608,7 @@ export function sessionSectionText(cwd: string | undefined): string {
   return [
     '## Remote workspace session',
     `This session's workspace is a remote directory: ${route.remoteCwd} on host "${route.hostId}" (connected over SSH).`,
-    'Your bash/read/write/edit/glob/grep tools execute on that server; relative paths resolve against the remote directory. Treat the server as your working machine.',
+    'Your shell and file tools (bash, read, glob, grep, and write/edit when your composition has them) execute on that server; relative paths resolve against the remote directory. Treat the server as your working machine.',
     'bash runs on ONE persistent remote shell: cd, exports and activated environments persist between calls. Pass workdir only when you must force a specific directory; avoid re-sourcing profiles or re-activating envs each call.',
     'For long-running commands (installs, builds, test suites) pass run_in_background: true to bash, then poll with job_output / job_list / job_kill.',
     'The ssh_exec/ssh_ls/ssh_read/ssh_write tools also target this host automatically (their alias parameter is optional here).',
@@ -619,6 +620,49 @@ export function sessionSectionText(cwd: string | undefined): string {
 interface AgentLike {
   session?: { header?: { cwd?: string } }
   ctx?: Context
+}
+
+/** 恒注册的遮蔽工具：Windows 上官方 tool-bash 被平台条件禁用，远程 bash 是会话唯一的 shell。 */
+const ALWAYS_SHADOWED = new Set(['bash'])
+
+/**
+ * 遮蔽注册的镜像规则：远程版只替换会话组合已经给该 agent 的同名工具，绝不新增
+ * 组合没有提供的能力。只读角色预设（tool-fs `write: false` / `edit: false`）若被
+ * 无条件补上远程 write/edit，"Verifier 不改文件" 这类靠工具集落实的约束在云工作区
+ * 里就失效了。
+ *
+ * - `visible('read') !== true`（作用域不可观测，或组合本来就没有文件读工具，例如
+ *   只挂常驻 shell 的预设）→ 旧行为：全量注册。宁可透明，也不让会话失去远程工具。
+ * - 镜像模式下，只有**确定**不可见（visible 返回 false）的工具才跳过；无法判定
+ *   （undefined）一律保留。
+ */
+export function selectShadowTools<T extends { name: string }>(
+  tools: T[],
+  visible: (name: string) => boolean | undefined,
+): T[] {
+  if (visible('read') !== true) return tools
+  return tools.filter((tool) => ALWAYS_SHADOWED.has(tool.name) || visible(tool.name) !== false)
+}
+
+/**
+ * 以 agent 作用域视角快照一组同名工具是否可见。快照必须在任何遮蔽注册之前一次
+ * 取好：注册之后再查，查到的是遮蔽工具自己。无法观测（没有 tools.get，或查询
+ * 抛错）的名字记为 undefined。
+ */
+function snapshotVisibility(scope: Context, names: readonly string[]): (name: string) => boolean | undefined {
+  const snapshot = new Map<string, boolean | undefined>()
+  const tools = (scope as unknown as { tools?: { get?: unknown } }).tools
+  const get = tools !== undefined && typeof tools.get === 'function'
+    ? (tools.get as (name: string, view: Context) => unknown)
+    : undefined
+  for (const name of names) {
+    try {
+      snapshot.set(name, get === undefined ? undefined : get(name, scope) != null)
+    } catch {
+      snapshot.set(name, undefined)
+    }
+  }
+  return (name) => snapshot.get(name)
 }
 
 /** 轻量文件诊断日志（scope.logger 不落盘，钩子链路必须自己留痕）。超上限重置文件，避免无限增长。 */
@@ -666,8 +710,11 @@ export function installSessionRouting(
             remoteCwd: route.remoteCwd,
             placeholderCwd: cwd ?? '',
           }
+          // 先快照组合里已可见的同名工具，再注册遮蔽——注册之后再查会查到自己。
+          const tools = buildSessionTools(runtime, sessionRoute, jobsProvider?.())
+          const selected = selectShadowTools(tools, snapshotVisibility(scope, tools.map((tool) => tool.name)))
           let registered = 0
-          for (const tool of buildSessionTools(runtime, sessionRoute, jobsProvider?.())) {
+          for (const tool of selected) {
             try {
               scope.tools.register(tool)
               registered += 1
@@ -677,13 +724,15 @@ export function installSessionRouting(
               debugLog(`shadow register failed for ${tool.name}: ${error instanceof Error ? error.message : String(error)}`)
             }
           }
+          const skipped = tools.filter((tool) => !selected.includes(tool)).map((tool) => tool.name)
           // 激活激活连接（切 activeAlias）：ssh_exec/ssh_ls 等全局 ssh_* 工具的
           // 无别名回退读 activeAlias——不切会让同一会话的 ssh_* 全部报
           // "no alias given"。connect 幂等（同池去重），失败由工具调用兜底。
           void runtime.connect(route.hostId).catch((error) => {
             debugLog(`connect ${route.hostId} failed: ${error instanceof Error ? error.message : String(error)}`)
           })
-          debugLog(`remote session routed: ${cwd} → ${route.hostId}:${route.remoteCwd} (${registered} shadow tools)`)
+          debugLog(`remote session routed: ${cwd} → ${route.hostId}:${route.remoteCwd} (${registered} shadow tools` +
+            `${skipped.length > 0 ? `; not offered by the composition, skipped: ${skipped.join(',')}` : ''})`)
         } catch (error) {
           // 路由失败绝不阻塞会话创建。
           debugLog(`session routing skipped: ${error instanceof Error ? error.message : String(error)}`)

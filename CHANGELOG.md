@@ -2,6 +2,15 @@
 
 All notable changes to `dsh-cloud-workspaces` are documented here.
 
+## [v0.10.6] — 2026-11-26
+
+### Changed
+- **Session shadow tools mirror the session's composition.** In a cloud workspace the `agent/created` hook registers remote `bash/read/write/edit/glob/grep/read_image`. It now takes a visibility snapshot of the agent scope *before* registering anything, and offers a remote tool only when the composition already exposes a tool of that name. `bash` is always offered (on Windows the local bash tool is platform-disabled, so the remote shell is the only one). A read-only preset (`tool-fs` with `write: false` / `edit: false`) therefore no longer receives remote `write`/`edit` behind its back, which is what lets role presets enforce "the reasoner and the verifier do not edit". When `read` is not observable or not offered at all, the previous full registration applies. The debug log names what was skipped: `… shadow tools; not offered by the composition, skipped: write,edit`.
+- The remote-session prompt section says "Your shell and file tools (bash, read, glob, grep, and write/edit when your composition has them) execute on that server" instead of listing write/edit unconditionally.
+
+### Added
+- Tests (+4, 186 total): mirror rule with a read-only composition, the unobservable/read-less fallback, unknown names kept, and the hook-level check that the snapshot precedes any registration.
+
 ## [v0.10.5] — 2026-11-26
 
 ### Fixed

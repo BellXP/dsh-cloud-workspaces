@@ -5,7 +5,7 @@
 
 import { describe, expect, it, vi } from 'vitest'
 import { join } from 'node:path'
-import { buildSessionTools, installSessionRouting, sessionSectionText } from '../src/session-tools'
+import { buildSessionTools, installSessionRouting, selectShadowTools, sessionSectionText } from '../src/session-tools'
 import { remoteRoot } from '../src/workspace'
 import type { SshRuntime } from '../src/ssh-service'
 
@@ -304,6 +304,26 @@ describe('sessionSectionText', () => {
   })
 })
 
+describe('selectShadowTools（镜像规则）', () => {
+  const tools = ['bash', 'read', 'write', 'edit', 'glob', 'grep', 'read_image'].map((name) => ({ name }))
+  const namesOf = (selected: Array<{ name: string }>) => selected.map((tool) => tool.name).sort()
+
+  it('read 可见、write/edit 不可见（只读组合）→ 不补远程 write/edit；bash 恒注册', () => {
+    const offered = new Set(['read', 'read_image', 'glob', 'grep'])
+    expect(namesOf(selectShadowTools(tools, (name) => offered.has(name)))).toEqual(['bash', 'glob', 'grep', 'read', 'read_image'])
+  })
+
+  it('read 不可见（作用域不可观测，或组合本就没有文件读工具）→ 旧行为：全量保留', () => {
+    expect(selectShadowTools(tools, () => false)).toEqual(tools)
+    expect(selectShadowTools(tools, () => undefined)).toEqual(tools)
+  })
+
+  it('无法判定（undefined）的名字一律保留；全部可见时与旧行为一致', () => {
+    expect(selectShadowTools(tools, (name) => (name === 'edit' ? undefined : true))).toEqual(tools)
+    expect(selectShadowTools(tools, () => true)).toEqual(tools)
+  })
+})
+
 describe('installSessionRouting', () => {
   it('占位 cwd 的会话注册 7 个遮蔽工具并激活连接；本地会话不注册', () => {
     const registered: string[] = []
@@ -329,6 +349,34 @@ describe('installSessionRouting', () => {
     listener!({ agent: { session: { header: { cwd: 'C:\\local\\proj' } }, ctx: { tools: { register: scopeRegister } } } })
     expect(scopeRegister).toHaveBeenCalledTimes(7)
     expect(connect).toHaveBeenCalledTimes(1)
+  })
+
+  it('只读组合的占位会话：补 bash/read/glob/grep/read_image，不补 write/edit；可见性快照先于任何注册', () => {
+    let listener: ((payload: { agent: unknown }) => void) | undefined
+    const ctxStub = {
+      on: (_event: string, cb: (payload: { agent: unknown }) => void) => { listener = cb; return () => {} },
+      effect: (fn: () => unknown, _name: string) => { fn(); return () => {} },
+    } as never
+    const connect = vi.fn(async () => ({ state: 'connected', alias: 'dev' }))
+    const runtimeStub = stubRuntime() as unknown as Record<string, unknown>
+    runtimeStub.connect = connect
+    installSessionRouting(ctxStub, runtimeStub as unknown as SshRuntime)
+    expect(listener).toBeTruthy()
+
+    // Windows 上的只读角色组合：官方 bash 被平台条件禁用，tool-fs 只开 read。
+    const offered = new Set(['read', 'read_image', 'glob', 'grep'])
+    let registering = false
+    // 一旦开始注册，任何名字都"可见"（会查到遮蔽工具自己）——快照若晚于注册就会失效。
+    const get = vi.fn((name: string) => (registering || offered.has(name) ? { name } : undefined))
+    const registered: string[] = []
+    const scopeRegister = vi.fn((tool: { name: string }) => {
+      registering = true
+      registered.push(tool.name)
+      return () => {}
+    })
+    listener!({ agent: { session: { header: { cwd: PLACEHOLDER } }, ctx: { tools: { register: scopeRegister, get } } } })
+    expect(registered.sort()).toEqual(['bash', 'glob', 'grep', 'read', 'read_image'])
+    expect(connect).toHaveBeenCalledWith('dev')
   })
 
   it('ctx.on 不可用时静默跳过', () => {
