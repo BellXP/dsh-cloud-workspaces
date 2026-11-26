@@ -48,6 +48,17 @@ export interface Config {
   maxReadBytes?: number
   /** 主机配置存储文件路径（空串 = 默认 ~/.dsh/dsh-remote-ide.json，测试可覆盖）。 */
   storeFile?: string
+  /**
+   * 终端/会话 shell 等待进行中的登录环境捕获的时长（ms）。捕获中的慢 profile
+   * 主机（`bash -l` 24~77 s）无论等不等都要付这笔时间，等下去换来的是快路径
+   * 快照 + 之后每个终端都毫秒级；0 = 不等，立即回退登录 shell。
+   */
+  terminalPrewarmWaitMs?: number
+  /**
+   * 登录环境快照的最大年龄（ms）：连接时发现更旧的登记，后台重捕一次
+   * （平台改了 profile 也能自动跟上）。0 = 从不按年龄刷新（只按远端文件是否存在）。
+   */
+  loginEnvMaxAgeMs?: number
 }
 
 export const Config: z<Config> = z.object({
@@ -57,6 +68,8 @@ export const Config: z<Config> = z.object({
   maxOutputBytes: z.number().min(1024).default(2 * 1024 * 1024),
   defaultExecTimeoutMs: z.number().min(1).default(60_000),
   maxReadBytes: z.number().min(1024).default(2 * 1024 * 1024),
+  terminalPrewarmWaitMs: z.number().min(0).default(150_000),
+  loginEnvMaxAgeMs: z.number().min(0).default(24 * 60 * 60_000),
   // 本仓库用 npm schemastery 3.x（无 .optional()），遵循官方惯例以空串表达缺省。
   storeFile: z.string().default(''),
 })
@@ -116,6 +129,9 @@ export class SshRuntime extends Service {
     // schemastery 在构造前已填充默认值；类型不编码该步骤。
     const storeFile = config.storeFile === '' ? undefined : config.storeFile
     this.store = new HostStore(storeFile)
+    // schemastery 在构造前已填充默认值；手搓配置（测试）缺省时回落到 schema 默认。
+    this.terminalPrewarmWaitMs = config.terminalPrewarmWaitMs ?? 150_000
+    this.loginEnvMaxAgeMs = config.loginEnvMaxAgeMs ?? 24 * 60 * 60_000
     this.engine_ = new SshEngine(this.store, {
       idleTimeoutMs: config.idleTimeoutMs,
       connectTimeoutMs: config.connectTimeoutMs,
@@ -217,21 +233,32 @@ export class SshRuntime extends Service {
   private readonly loginEnvAttempted = new Set<string>()
   /** 启动后验证过远端仍存在的快照路径（alias → remotePath）。 */
   private readonly loginEnvVerified = new Map<string, string>()
-  /** 进行中的捕获（loginEnvScriptFor 最多等它 3s——快主机首开终端即加速）。 */
+  /** 进行中的捕获（loginEnvScriptFor 最多等它 terminalPrewarmWaitMs）。 */
   private readonly loginEnvPending = new Map<string, Promise<unknown>>()
+  /** 终端/会话 shell 等待进行中捕获的时长（Config.terminalPrewarmWaitMs）。 */
+  private readonly terminalPrewarmWaitMs: number
+  /** 快照最大年龄（Config.loginEnvMaxAgeMs；0 = 不按年龄刷新）。 */
+  private readonly loginEnvMaxAgeMs: number
 
   /**
-   * 后台确保该主机有登录环境快照（首次连接后自动触发一次；已在 store
-   * 登记则只做验证记账）。失败仅 debugLog，绝不影响连接语义。
+   * 后台确保该主机有登录环境快照：首次连接自动触发一次捕获；已登记则
+   * 只做验证记账——除非登记已超过 loginEnvMaxAgeMs（后台刷新）。
+   * 失败仅 debugLog，绝不影响连接语义。每次启动内每主机至多自动尝试一次。
    */
   private ensureLoginEnv(alias: string): void {
     if (this.disposed || this.loginEnvAttempted.has(alias) || this.loginEnvPending.has(alias)) return
     const recorded = this.engine_.getEntry(alias)?.loginEnv
-    if (recorded !== undefined) {
-      this.loginEnvAttempted.add(alias)
-      return
-    }
     this.loginEnvAttempted.add(alias)
+    if (recorded !== undefined && !this.isLoginEnvStale(recorded)) return
+    this.captureInBackground(alias)
+  }
+
+  private isLoginEnvStale(record: LoginEnvRecord): boolean {
+    return this.loginEnvMaxAgeMs > 0 && Date.now() - record.generatedAt > this.loginEnvMaxAgeMs
+  }
+
+  /** 后台捕获：失败只记日志；成功路径见 captureLoginEnv。 */
+  private captureInBackground(alias: string): void {
     const pending = this.captureLoginEnv(alias)
       .catch((error: unknown) => {
         debugLog(`login-env: background capture failed for ${alias}: ${error instanceof Error ? error.message : String(error)}`)
@@ -257,13 +284,31 @@ export class SshRuntime extends Service {
 
   /**
    * 终端/会话 shell 的快速路径取数：返回已登记**且远端仍存在**的快照路径；
-   * 没有则 undefined（调用方回退登录 shell）。进行中的后台捕获最多等 3s。
+   * 没有则 undefined（调用方回退登录 shell）。
+   *
+   * 顺序：① 已可用的快照直接用（即使后台正在刷新年龄到期的快照——旧的仍可用）；
+   * ② 没有可用的而后台捕获进行中：最多等 terminalPrewarmWaitMs（默认 150 s）——
+   *    慢 profile 主机的登录 shell 回退同样要几十秒，等捕获完成换来的是快路径
+   *    + 之后每个终端都快；③ 仍没有 → undefined。
    */
   async loginEnvScriptFor(alias: string): Promise<string | undefined> {
+    const usable = await this.usableLoginEnv(alias)
+    if (usable !== undefined) return usable
     const pending = this.loginEnvPending.get(alias)
     if (pending !== undefined) {
-      await Promise.race([pending, new Promise((resolve) => setTimeout(resolve, 3000))])
+      await Promise.race([pending, new Promise((resolve) => setTimeout(resolve, this.terminalPrewarmWaitMs))])
+      const afterCapture = await this.usableLoginEnv(alias)
+      if (afterCapture !== undefined) return afterCapture
     }
+    return undefined
+  }
+
+  /**
+   * 已登记且远端仍存在的快照路径。登记在、远端文件却没了（Pod 重建清掉
+   * ~/.cache 等）→ 清登记并后台重捕，返回 undefined：否则 ensureLoginEnv 会因
+   * "已登记"永远跳过，这台主机的终端就一直回退登录 shell。
+   */
+  private async usableLoginEnv(alias: string): Promise<string | undefined> {
     const recorded = this.engine_.getEntry(alias)?.loginEnv
     if (recorded === undefined) return undefined
     if (this.loginEnvVerified.get(alias) === recorded.remotePath) return recorded.remotePath
@@ -273,10 +318,20 @@ export class SshRuntime extends Service {
         this.loginEnvVerified.set(alias, recorded.remotePath)
         return recorded.remotePath
       }
+      this.recaptureAfterLoss(alias)
     } catch {
       // 探测异常（连接抖动等）按无快照处理——回退登录 shell，不阻塞终端。
     }
     return undefined
+  }
+
+  /** 远端快照丢失后的自愈：清登记 + 允许一次后台重捕（本次调用仍回退登录 shell）。 */
+  private recaptureAfterLoss(alias: string): void {
+    debugLog(`login-env: snapshot missing on ${alias} (${this.engine_.getEntry(alias)?.loginEnv?.remotePath ?? 'no path'}) — recapturing in the background`)
+    this.loginEnvVerified.delete(alias)
+    this.store.setLoginEnv(alias, undefined)
+    this.loginEnvAttempted.delete(alias)
+    this.ensureLoginEnv(alias)
   }
 
   // ----------------------------------------------------------- host store

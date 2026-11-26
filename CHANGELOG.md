@@ -2,6 +2,19 @@
 
 All notable changes to `dsh-cloud-workspaces` are documented here.
 
+## [v0.10.3] — 2026-11-26
+
+### Changed
+- **Robust login-environment prewarm for slow-profile hosts** (ModelArts/Atlas: `bash -l` 24–77 s because the platform `.bashrc` sources the Ascend `set_env.sh` scripts). The snapshot mechanism (capture once in the background, then start terminals with `bash --noprofile --norc -i` + source the snapshot) existed since v0.8.0 but degraded in three situations, all fixed:
+  - a terminal requested while the background capture was still running fell back to the login shell after 3 s — it now waits for the capture (`terminalPrewarmWaitMs`, default 150 s; the login-shell fallback costs the same 24–77 s and leaves no snapshot behind), so the first terminal lands on the fast path and every later one starts in ~1 s;
+  - a recorded snapshot whose remote file disappeared (pod rebuild wiped `~/.cache`) never re-captured — `ensureLoginEnv` skipped the host forever because it was "already recorded"; `loginEnvScriptFor` now clears the record and re-captures in the background;
+  - snapshots never aged — a recorded snapshot older than `loginEnvMaxAgeMs` (default 24 h; 0 disables) is refreshed in the background on connect while the old one keeps serving terminals.
+  Both knobs are plugin `Config` fields (`terminalPrewarmWaitMs`, `loginEnvMaxAgeMs`) passed through to `SshRuntime`.
+- Measured on `notebook-4312` (ModelArts, 320 cores) with the built `spawnSshTerminal`: fast path **1.2 s / 0.9 s** bootstrap vs **38.7 s** login shell; the fast-path terminal reports `(PyTorch-2.6.0)`, `ASCEND_TOOLKIT_HOME=/usr/local/Ascend/cann-8.5.0`, correct `PS1`.
+
+### Added
+- Tests (+5, 179 total): first-terminal wait for an in-flight capture, configurable wait cap, snapshot loss → background recapture (success and failure paths), age-based refresh with the old snapshot still serving.
+
 ## [v0.10.2] — 2026-11-26
 
 ### Fixed

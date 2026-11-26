@@ -49,12 +49,25 @@ export interface Config {
   maxReadBytes?: number
   /** When true, announce the remote tools to the agent via a prompt section. */
   announceToAgent?: boolean
+  /**
+   * 终端/会话 shell 等待进行中登录环境捕获的时长（ms，默认 150000）。慢 profile
+   * 主机（如 ModelArts/Atlas 的 Ascend 环境，`bash -l` 24~77 s）首开终端时后台正在
+   * 捕获快照：等它完成走快路径，而不是 3 s 后回退同样慢的登录 shell。
+   */
+  terminalPrewarmWaitMs?: number
+  /**
+   * 登录环境快照的最大年龄（ms，默认 24 h）：连接时发现更旧的登记后台刷新一次，
+   * 平台改了 profile 也能自动跟上；0 = 不按年龄刷新。
+   */
+  loginEnvMaxAgeMs?: number
 }
 
 export const Config: z<Config> = z.object({
   enabled: z.boolean().default(true),
   maxReadBytes: z.number().min(64 * 1024).max(64 * 1024 * 1024).default(2 * 1024 * 1024),
   announceToAgent: z.boolean().default(true),
+  terminalPrewarmWaitMs: z.number().min(0).default(150_000),
+  loginEnvMaxAgeMs: z.number().min(0).default(24 * 60 * 60_000),
 })
 
 /** Schema default, re-read for hand-built test contexts. */
@@ -94,7 +107,11 @@ export async function apply(ctx: Context, config?: Config): Promise<void> {
   // `inject`, and `ssh` cannot be declared there — we provide it ourselves,
   // which would self-deadlock. ctx.plugin() alone returns the Fiber, not the
   // service instance.
-  await ctx.plugin(SshRuntime, { maxReadBytes: resolve().maxReadBytes })
+  await ctx.plugin(SshRuntime, {
+    maxReadBytes: resolve().maxReadBytes,
+    terminalPrewarmWaitMs: resolve().terminalPrewarmWaitMs,
+    loginEnvMaxAgeMs: resolve().loginEnvMaxAgeMs,
+  })
   const runtime = ctx.get('ssh')
   if (!runtime) throw new Error('dsh-remote-ide: SshRuntime did not provide ctx.ssh')
 

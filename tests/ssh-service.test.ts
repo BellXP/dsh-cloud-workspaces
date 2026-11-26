@@ -10,6 +10,7 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { Context } from '@deepseek-ai/cordis'
 import SshRuntime from '../src/ssh-service'
+import { HostStore } from '../src/store'
 
 /** 可编程的 ssh2 假实现：事件注册 + 测试辅助触发。 */
 const fake = vi.hoisted(() => {
@@ -62,6 +63,9 @@ const fake = vi.hoisted(() => {
     static nextConnectBehavior: 'ready' | 'error' = 'ready'
     /** 全部 exec 命令记录（登录环境快照的自动触发断言用）。 */
     static execLog: string[] = []
+    /** 捕获命令（__DSH_ENV_BEGIN__）的响应延迟/文本：模拟慢 profile 主机的后台捕获。 */
+    static captureDelayMs = 0
+    static captureText = 'ok'
     exec = vi.fn()
     shell = vi.fn()
     sftp = vi.fn()
@@ -70,15 +74,20 @@ const fake = vi.hoisted(() => {
     constructor() {
       super()
       FakeClient.instances.push(this)
-      // 默认 exec：模拟一条成功命令（输出 'ok'，退出码 0）。
+      // 默认 exec：模拟一条成功命令（输出 'ok'，退出码 0）；捕获命令按静态配置延迟/定制文本。
       this.exec.mockImplementation((command: string, cb: (err: unknown, stream: FakeStream) => void) => {
         FakeClient.execLog.push(command)
+        const isCapture = command.includes('__DSH_ENV_BEGIN__')
+        const text = isCapture ? FakeClient.captureText : 'ok'
+        const delay = isCapture ? FakeClient.captureDelayMs : 0
         const stream = new FakeStream()
-        queueMicrotask(() => {
+        const deliver = () => {
           cb(null, stream)
-          stream.emit('data', Buffer.from('ok'))
+          stream.emit('data', Buffer.from(text))
           stream.emit('close', 0)
-        })
+        }
+        if (delay > 0) setTimeout(deliver, delay)
+        else queueMicrotask(deliver)
         return this
       })
     }
@@ -239,6 +248,8 @@ describe('SshRuntime 登录环境快照（终端加速）', () => {
     fake.FakeClient.instances.length = 0
     fake.FakeClient.execLog.length = 0
     fake.FakeClient.nextConnectBehavior = 'ready'
+    fake.FakeClient.captureDelayMs = 0
+    fake.FakeClient.captureText = 'ok'
   })
 
   /** 极简 exec 流：注册 data 即投递文本，注册 close 时按 code 结束。 */
@@ -265,10 +276,11 @@ describe('SshRuntime 登录环境快照（终端加速）', () => {
     '__DSH_ENV_PS1__$ ',
   ].join('\n')
 
-  /** 武装捕获：capture 命令回快照，探针按 probeOk，其余 'ok'；SFTP 记录写入。 */
+  /** 武装捕获：capture 命令回快照，探针按 probeOk，其余 'ok'；SFTP 记录写入。
+   *  captureDelayMs > 0 时模拟慢 profile 主机：捕获输出延迟到达。 */
   function armCapture(
     client: { exec: ReturnType<typeof vi.fn>; sftp: ReturnType<typeof vi.fn> },
-    opts: { probeOk?: boolean; written?: Array<{ path: string; content: string }> },
+    opts: { probeOk?: boolean; written?: Array<{ path: string; content: string }>; captureDelayMs?: number; captureOk?: boolean },
   ): void {
     client.sftp.mockImplementation((cb: (err: unknown, sftp: unknown) => void) => {
       queueMicrotask(() => cb(null, {
@@ -280,16 +292,24 @@ describe('SshRuntime 登录环境快照（终端加速）', () => {
       }))
     })
     client.exec.mockImplementation((command: string, cb: (err: unknown, stream: unknown) => void) => {
+      fake.FakeClient.execLog.push(command)
+      const isCapture = command.includes('__DSH_ENV_BEGIN__')
       const isProbe = command.startsWith('test -f ')
-      const text = command.includes('__DSH_ENV_BEGIN__') ? `${SNAPSHOT}\n` : isProbe && opts.probeOk === false ? '' : 'ok\n'
+      const captureText = opts.captureOk === false ? 'ok\n' : `${SNAPSHOT}\n`
+      const text = isCapture ? captureText : isProbe && opts.probeOk === false ? '' : 'ok\n'
       const code = isProbe && opts.probeOk === false ? 1 : 0
-      queueMicrotask(() => cb(null, streamOf(text, code)))
+      const deliver = () => cb(null, streamOf(text, code))
+      if (isCapture && (opts.captureDelayMs ?? 0) > 0) setTimeout(deliver, opts.captureDelayMs)
+      else queueMicrotask(deliver)
     })
   }
 
-  async function setupHost(storeFile = tmpStoreFile()): Promise<{ fiber: Fiber; runtime: SshRuntime; storeFile: string }> {
+  async function setupHost(
+    storeFile = tmpStoreFile(),
+    extraConfig: Record<string, unknown> = {},
+  ): Promise<{ fiber: Fiber; runtime: SshRuntime; storeFile: string }> {
     const context = new Context()
-    const f = await context.plugin(SshRuntime, { storeFile })
+    const f = await context.plugin(SshRuntime, { storeFile, ...extraConfig })
     const service = context.ssh
     service.upsertHost({
       alias: 'dev',
@@ -327,18 +347,102 @@ describe('SshRuntime 登录环境快照（终端加速）', () => {
     await fiber.dispose()
   })
 
-  it('登记过但远端快照丢失 → loginEnvScriptFor 返回 undefined（回退登录 shell）', async () => {
+  it('登记过但远端快照丢失 → 后台重捕；重捕成功则本次就走快路径（自愈）', async () => {
+    const { fiber: f1, runtime: r1, storeFile } = await setupHost()
+    await r1.connect('dev')
+    armCapture(fake.FakeClient.instances[0]!, {})
+    const old = await r1.captureLoginEnv('dev')
+    await f1.dispose()
+
+    // 新 runtime、同一 store：登记在、远端文件没了 → 探针失败 → 清登记 + 后台重捕 →
+    // loginEnvScriptFor 等到重捕完成，返回新快照路径。
+    const { fiber: f2, runtime: r2 } = await setupHost(storeFile)
+    await r2.connect('dev') // 已登记且未过期 → 此时不自动重捕
+    const client = fake.FakeClient.instances.at(-1)!
+    fake.FakeClient.execLog.length = 0
+    armCapture(client, { probeOk: false })
+    await expect(r2.loginEnvScriptFor('dev')).resolves.toBe('ok/.cache/dsh-cloud-workspaces/login-env.sh')
+    expect(fake.FakeClient.execLog.filter((c) => c.includes('__DSH_ENV_BEGIN__')).length).toBe(1)
+    const fresh = await r2.engine.getEntry('dev')?.loginEnv
+    expect(fresh?.remotePath).toBe(old.remotePath)
+    expect(fresh?.generatedAt ?? 0).toBeGreaterThanOrEqual(old.generatedAt)
+    await f2.dispose()
+  })
+
+  it('登记过但远端快照丢失且重捕失败 → 回退登录 shell（undefined），登记已清，下次连接会再试', async () => {
     const { fiber: f1, runtime: r1, storeFile } = await setupHost()
     await r1.connect('dev')
     armCapture(fake.FakeClient.instances[0]!, {})
     await r1.captureLoginEnv('dev')
     await f1.dispose()
 
-    // 新 runtime、同一 store：登记在、验证不在 → 探针失败 → undefined。
     const { fiber: f2, runtime: r2 } = await setupHost(storeFile)
-    await r2.connect('dev') // 已登记 → 只记账，不自动重捕
-    armCapture(fake.FakeClient.instances.at(-1)!, { probeOk: false })
+    await r2.connect('dev')
+    const client = fake.FakeClient.instances.at(-1)!
+    fake.FakeClient.execLog.length = 0
+    armCapture(client, { probeOk: false, captureOk: false }) // 捕获输出不可解析 → 失败
     await expect(r2.loginEnvScriptFor('dev')).resolves.toBeUndefined()
+    await vi.waitFor(() => {
+      expect(fake.FakeClient.execLog.filter((c) => c.includes('__DSH_ENV_BEGIN__')).length).toBe(1)
+    })
+    expect(await r2.engine.getEntry('dev')?.loginEnv).toBeUndefined()
+    await f2.dispose()
+  })
+
+  it('首开终端时后台捕获进行中：等捕获完成走快路径，而不是 3 s 后回退登录 shell', async () => {
+    // 模拟慢 profile 主机：connect 触发的后台捕获 80 ms 后才产出快照。
+    fake.FakeClient.captureDelayMs = 80
+    fake.FakeClient.captureText = `${SNAPSHOT}\n`
+    const { fiber, runtime } = await setupHost(tmpStoreFile(), { terminalPrewarmWaitMs: 2_000 })
+    // getConnectionFor 与侧栏终端 seam 的调用顺序一致：先建连（内部触发后台捕获——
+    // 捕获命令按 FakeClient.captureDelayMs 延迟产出），再武装 SFTP/探针，再取快照路径。
+    await runtime.getConnectionFor('dev')
+    armCapture(fake.FakeClient.instances[0]!, { captureDelayMs: 80 })
+    const started = Date.now()
+    await expect(runtime.loginEnvScriptFor('dev')).resolves.toBe('ok/.cache/dsh-cloud-workspaces/login-env.sh')
+    expect(Date.now() - started).toBeGreaterThanOrEqual(60)
+    await fiber.dispose()
+  })
+
+  it('等待上限可配：terminalPrewarmWaitMs=20 时捕获未完成就回退（undefined），完成后即可用', async () => {
+    fake.FakeClient.captureDelayMs = 150
+    fake.FakeClient.captureText = `${SNAPSHOT}\n`
+    const { fiber, runtime } = await setupHost(tmpStoreFile(), { terminalPrewarmWaitMs: 20 })
+    await runtime.getConnectionFor('dev')
+    armCapture(fake.FakeClient.instances[0]!, { captureDelayMs: 150 })
+    await expect(runtime.loginEnvScriptFor('dev')).resolves.toBeUndefined()
+    // 等后台捕获落地后，下一次取数拿到快照。
+    await vi.waitFor(async () => {
+      await expect(runtime.loginEnvScriptFor('dev')).resolves.toBe('ok/.cache/dsh-cloud-workspaces/login-env.sh')
+    })
+    await fiber.dispose()
+  })
+
+  it('快照年龄超过 loginEnvMaxAgeMs：连接时后台刷新一次，刷新期间旧快照照常可用；未过期则不刷新', async () => {
+    const storeFile = tmpStoreFile()
+    const seed = new HostStore(storeFile)
+    seed.upsert({ alias: 'dev', host: '10.0.0.1', user: 'root', auth: { kind: 'password', password: 'secret' } })
+    seed.setLoginEnv('dev', { remotePath: '/root/.cache/dsh-cloud-workspaces/login-env.sh', generatedAt: Date.now() - 48 * 3600_000, varCount: 3 })
+    const { fiber, runtime } = await setupHost(storeFile, { loginEnvMaxAgeMs: 24 * 3600_000 })
+    await runtime.connect('dev')
+    await vi.waitFor(() => {
+      expect(fake.FakeClient.execLog.some((command) => command.includes('__DSH_ENV_BEGIN__'))).toBe(true)
+    })
+    // 刷新期间旧快照（远端仍在）照常可用，不阻塞终端。
+    await expect(runtime.loginEnvScriptFor('dev')).resolves.toBe('/root/.cache/dsh-cloud-workspaces/login-env.sh')
+    await fiber.dispose()
+
+    // 对照：未过期的登记 → 连接不触发捕获。
+    fake.FakeClient.instances.length = 0
+    fake.FakeClient.execLog.length = 0
+    const fresh = tmpStoreFile()
+    const seed2 = new HostStore(fresh)
+    seed2.upsert({ alias: 'dev', host: '10.0.0.1', user: 'root', auth: { kind: 'password', password: 'secret' } })
+    seed2.setLoginEnv('dev', { remotePath: '/root/.cache/dsh-cloud-workspaces/login-env.sh', generatedAt: Date.now(), varCount: 3 })
+    const { fiber: f2, runtime: r2 } = await setupHost(fresh, { loginEnvMaxAgeMs: 24 * 3600_000 })
+    await r2.connect('dev')
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    expect(fake.FakeClient.execLog.some((command) => command.includes('__DSH_ENV_BEGIN__'))).toBe(false)
     await f2.dispose()
   })
 })
