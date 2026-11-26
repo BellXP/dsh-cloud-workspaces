@@ -7,7 +7,7 @@
  * 此文件只保留 client 半 ↔ host 半的 wire 形状与 schema 描述。
  */
 
-import z from 'schemastery'
+import z from '@deepseek-ai/schemastery'
 
 /** 一台 SSH 主机（client 表单提交/主机卡展示的同一契约；口令 write-only）。 */
 export interface SshHostConfig {

@@ -7,6 +7,8 @@
  * - 注册 settings.section slot（id 'ssh-hosts'）——DSH 设置页的自定义区块；
  * - 主机 CRUD / 测试连接 / 远端目录浏览 / 占位工作区创建全部经 Typert
  *   remote（ctx.remote.ssh-remote.<method>，host 半 SshRemoteService 实现）；
+ * - 工作区选择器填充官方 ui-workspace 的三个 directory-flow 洞（0.2.2 起含
+ *   workspace.picker Factory 洞），本机目录选择经 ctx.uiWorkspace.pickDirectory；
  * - 样式只用 --dsw-alias-* design token，不引入额外 UI 库。
  *
  * 与 src/typert.ts 的端点参数名（wire）必须一一对应：
@@ -1181,9 +1183,12 @@ window.__ModuleLoader__.load({
         inject: injected,
       }, SshHostsSection))
 
-      // 工作区选择器：填充官方 ui-workspace 的两个 directory-flow 洞
-      // （conversation hero + sidebar 的「添加工作区」入口只在洞被占用时
-      // 出现；onPicked(路径) 交给官方 createWorkspace 收养）。
+      // 工作区选择器：填充官方 ui-workspace 的 directory-flow 洞（conversation hero
+      // + sidebar 的「添加工作区」入口只在洞被占用时出现；onPicked(路径) 交给官方
+      // createWorkspace 收养）。0.2.2 起官方有三个洞——第三洞
+      // workspace.picker.directoryFlow 挂在可复用的 workspace.picker Factory 上
+      //（其它插件的面也用它选工作区）；官方目录选择器包三洞同占，本插件同样
+      // 三洞同占（同一组件、同一 priority:-100 遮蔽官方本机选择器）。
       // 0.1.7 排障：选择器注册失败绝不拖垮设置卡——独立 try/catch + 显式
       // console 留痕（F12 一眼可辨）。
       try {
@@ -1197,17 +1202,31 @@ window.__ModuleLoader__.load({
           mkdirRemote,
           createPlaceholder,
           pickDirectory: async () => {
-            const surface = workspaces()
-            if (!surface || typeof surface.pickDirectory !== 'function') return null
-            return surface.pickDirectory()
+            // 0.2.2：本机目录选择（宿主原生对话框）从 workspaces 面迁到了
+            // uiWorkspace 服务（ui-workspace 的 UiWorkspace.pickDirectory）；
+            // 旧 workspaces 面与 remote.directoryPicker 原始 RPC 作兜底。
+            let uiWorkspace
+            try { uiWorkspace = ctx.get('uiWorkspace') } catch { uiWorkspace = undefined }
+            if (uiWorkspace && typeof uiWorkspace.pickDirectory === 'function') return uiWorkspace.pickDirectory()
+            const legacy = workspaces()
+            if (legacy && typeof legacy.pickDirectory === 'function') return legacy.pickDirectory()
+            let picker
+            try { picker = ctx.get('remote.directoryPicker') } catch { picker = undefined }
+            if (picker && typeof picker.pick === 'function') {
+              const result = await picker.pick()
+              if (result && result.ok === true) return result.value ?? null
+              throw new Error((result && result.error && result.error.message) || 'directory picker failed')
+            }
+            return null
           },
         }
         ctx.slots.inject('conversation.hero.workspace.directoryFlow', () =>
-          ctx.slots.inject('sidebar.workspaces.directoryFlow', function* () {
-            yield ctx.slots.register({ name: 'conversation.hero.workspace.directoryFlow', id: 'dsh-remote-ide', priority: -100 }, WorkspacePicker)
-            yield ctx.slots.register({ name: 'sidebar.workspaces.directoryFlow', id: 'dsh-remote-ide', priority: -100 }, WorkspacePicker)
-          }),
-        )
+          ctx.slots.inject('sidebar.workspaces.directoryFlow', () =>
+            ctx.slots.inject('workspace.picker.directoryFlow', function* () {
+              yield ctx.slots.register({ name: 'conversation.hero.workspace.directoryFlow', id: 'dsh-remote-ide', priority: -100 }, WorkspacePicker)
+              yield ctx.slots.register({ name: 'sidebar.workspaces.directoryFlow', id: 'dsh-remote-ide', priority: -100 }, WorkspacePicker)
+              yield ctx.slots.register({ name: 'workspace.picker.directoryFlow', id: 'dsh-remote-ide', priority: -100 }, WorkspacePicker)
+            })))
       } catch (error) {
         console.error('[dsh-remote-ide] workspace picker registration failed:', error)
       }
@@ -1249,9 +1268,9 @@ window.__ModuleLoader__.load({
       }
     }
 
-    // 'workspaces' 面不经 exports.inject 声明（loader 解析不了会连累整个
-    // client 加载）；运行时面走 package.json dsh.client.inject 声明的
-    // dsh-client-runtime，apply 内 ctx.get('workspaces') 防御式获取。
+    // 'workspaces' / 'uiWorkspace' 面不经 exports.inject 声明（loader 解析不了会连累
+    // 整个 client 加载）；运行时面走 package.json dsh.client.inject 声明的
+    // dsh-client-runtime，apply 内 ctx.get(...) 防御式获取。
     // __test：纯函数面，供离线冒烟测试（node smoke-plugins.mjs）使用。
     return { apply, inject: ['slots', 'connection', 'remote'], __test: { placeholderLabelFor, relativeReferenceFor, quoteBlockFor } }
   },

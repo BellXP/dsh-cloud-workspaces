@@ -200,6 +200,8 @@ const fake = vi.hoisted(() => {
     sessionGroups: [] as number[],
     /** ps -o tpgid= 结果（undefined = 前台组解析失败）。 */
     foregroundPid: undefined as number | undefined,
+    /** 登录 shell（terminalEnvironment 的 getent passwd 第 7 字段；'' = 探测不到）。 */
+    loginShell: '/bin/bash',
     kills: [] as Array<{ signal: string; args: string }>,
     execCalls: [] as string[],
     channels: [] as FakeStream[],
@@ -254,6 +256,10 @@ const fake = vi.hoisted(() => {
     }
     // wrapper 命令：流式，由测试控制（先写 pid 文件，再发数据与 close）。
     if (script.includes('dsh_setsid')) return null
+    // terminalEnvironment：登录 shell 探测（getent passwd 第 7 字段）。
+    if (script.includes('dsh_shell="$(getent passwd')) {
+      return { stdout: state.loginShell, stderr: '', exitCode: state.loginShell === '' ? 1 : 0 }
+    }
     // 远程环境传输（readRemoteEnvironment）。
     if (script.includes('getent passwd')) {
       const home = Buffer.from(state.home, 'utf8').toString('base64')
@@ -335,6 +341,7 @@ const fake = vi.hoisted(() => {
     state.execCalls = []
     state.channels = []
     state.shells = []
+    state.loginShell = '/bin/bash'
   }
 
   class FakeClient extends MiniEmitter {
@@ -547,6 +554,31 @@ describe('SshSubprocessRuntime 远程 subprocess', () => {
     const controller = new AbortController()
     controller.abort(new Error('canceled before start'))
     expect(() => subprocess.spawn(spawnSpec({ signal: controller.signal }))).toThrow('aborted before spawn')
+    await fiber.dispose()
+  })
+
+  it('spawn：stdio.control 独立控制通道（0.2.x seam 成员）SSH 无载体 → 同步拒绝', async () => {
+    const { fiber, subprocess } = await setup()
+    const spec = spawnSpec({})
+    expect(() => subprocess.spawn({ ...spec, stdio: { ...spec.stdio, control: 'pipe' } }))
+      .toThrow('control channel')
+    // 未请求时句柄的 control 恒为 undefined（接口允许缺席）。
+    const handle = subprocess.spawn(spec)
+    expect(handle.control).toBeUndefined()
+    handle.terminate()
+    await fiber.dispose()
+  })
+
+  it('terminalEnvironment（0.2.x seam 成员）：posix + 登录 shell；探测不到则省略 defaultShell', async () => {
+    const { fiber, subprocess } = await setup()
+    expect(await subprocess.terminalEnvironment()).toEqual({ platform: 'posix', defaultShell: '/bin/bash' })
+    fake.state.loginShell = '/bin/zsh'
+    expect(await subprocess.terminalEnvironment()).toEqual({ platform: 'posix', defaultShell: '/bin/zsh' })
+    fake.state.loginShell = ''
+    expect(await subprocess.terminalEnvironment()).toEqual({ platform: 'posix' })
+    const controller = new AbortController()
+    controller.abort(new Error('canceled'))
+    await expect(subprocess.terminalEnvironment(controller.signal)).rejects.toThrow('canceled')
     await fiber.dispose()
   })
 

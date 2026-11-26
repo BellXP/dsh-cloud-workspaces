@@ -23,7 +23,7 @@ import type { SshRuntime } from './ssh-service'
 import { quoteSh, type PersistentShellSession } from './engine'
 import { jsonSafe } from './jsonsafe'
 import { debugLog } from './debug-log'
-import { startRemoteJob } from './job-runner'
+import { jobOwnerOf, startRemoteJob, type JobExecLike } from './job-runner'
 import { resolveRemotePath, routeByCwd } from './workspace'
 
 /** 一个远程会话的路由（钩子时确定，此后全部工具共用）。 */
@@ -281,14 +281,14 @@ export function buildSessionTools(runtime: SshRuntime, route: SessionRoute, jobs
       }
       return bashTerminalView(result)
     },
-    async execute(args: { command: string; description?: string; timeoutMs?: number; workdir?: string; run_in_background?: boolean }, exec?: { agent?: unknown }) {
+    async execute(args: { command: string; description?: string; timeoutMs?: number; workdir?: string; run_in_background?: boolean }, exec?: JobExecLike) {
       const cwd = args.workdir !== undefined && args.workdir !== '' ? resolveInSession(route, args.workdir) : route.remoteCwd
       if (args.run_in_background === true) {
         return jsonSafe(startRemoteJob({ engine, jobs }, {
           hostId: route.hostId,
           command: args.command,
           cwd,
-          ...(exec?.agent !== undefined ? { agent: exec.agent as never } : {}),
+          ...jobOwnerOf(exec),
         }))
       }
       // 前台命令走会话常驻 shell（连接池上复用一条 bash 通道）：

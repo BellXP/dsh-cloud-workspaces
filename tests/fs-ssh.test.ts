@@ -218,10 +218,16 @@ const fake = vi.hoisted(() => {
       cb(undefined, Buffer.from(node.content))
     }
 
-    createReadStream(path: string) {
+    createReadStream(path: string, options?: { start?: number; end?: number }) {
       const target = this.targetOf(path)
       const node = this.nodes.get(target)
-      const content = node?.kind === 'file' ? node.content : Buffer.alloc(0)
+      let content = node?.kind === 'file' ? node.content : Buffer.alloc(0)
+      // 与 fs.createReadStream 同义：start/end 为闭区间字节偏移（readByteRange 窗口）。
+      if (options !== undefined) {
+        const start = options.start ?? 0
+        const end = options.end === undefined ? content.length : options.end + 1
+        content = content.subarray(Math.min(start, content.length), Math.min(end, content.length))
+      }
       return Readable.from([Buffer.from(content)])
     }
 
@@ -715,6 +721,129 @@ describe('SshFileSystem 远程文件系统', () => {
       newString: 'again',
       replaceAll: false,
     }, { version: observed })).rejects.toMatchObject({ code: 'FS_STALE_VERSION' })
+    await fiber.dispose()
+  })
+
+  // ------------------------------------- 0.2.x 新增抽象成员（对照 fs-local 语义）
+
+  it('readByteRange：按窗口读取；越界空窗口；缺失/目录报对应错误码', async () => {
+    const { fiber, fs } = await setup()
+    const target = await fs.resolve('project/main.ts') // "console.log('hi')\n" = 17 字节
+    expect(Buffer.from(await fs.readByteRange(target, { offset: 0, length: 7 })).toString('utf8')).toBe('console')
+    expect(Buffer.from(await fs.readByteRange(target, { offset: 7, length: 100 })).toString('utf8')).toBe(".log('hi')\n")
+    expect((await fs.readByteRange(target, { offset: 100, length: 10 })).byteLength).toBe(0)
+    expect((await fs.readByteRange(target, { offset: 0, length: 0 })).byteLength).toBe(0)
+    const missing = await fs.resolve('project/nope.ts')
+    await expect(fs.readByteRange(missing, { offset: 0, length: 1 })).rejects.toMatchObject({ code: 'FS_NOT_FOUND' })
+    const dir = await fs.resolve('project')
+    await expect(fs.readByteRange(dir, { offset: 0, length: 1 })).rejects.toMatchObject({ code: 'FS_NOT_REGULAR_FILE' })
+    await fiber.dispose()
+  })
+
+  it('patchText：应用 hunk（LF 基准、恢复 CRLF 行尾、沿用 mode）；未命中报 FS_PATCH_MISMATCH', async () => {
+    const { fiber, fs } = await setup()
+    const target = await fs.resolve('project/main.ts')
+    const outcome = await fs.patchText(target, [{
+      lineNumber: 1,
+      oldLines: ["console.log('hi')"],
+      newLines: ["console.error('hi')", "console.warn('bye')"],
+      isEndOfFile: false,
+    }])
+    expect(outcome.before).toBe("console.log('hi')\n")
+    expect(outcome.after).toBe("console.error('hi')\nconsole.warn('bye')\n")
+    expect(await fs.readText(target)).toBe(outcome.after)
+    expect((await fs.stat(target))!.version).toBe(outcome.version)
+    // 源文件 mode 0o644 沿用（staging 文件按既有 mode chmod 后发布）。
+    const sftp = fake.state.sftp as unknown as { nodes: Map<string, { kind: string; mode: number }> }
+    expect(sftp.nodes.get('/home/dev/project/main.ts')!.mode & 0o777).toBe(0o644)
+
+    await expect(fs.patchText(target, [{
+      lineNumber: 1, oldLines: ['not-there()'], newLines: ['x()'], isEndOfFile: false,
+    }])).rejects.toMatchObject({ code: 'FS_PATCH_MISMATCH' })
+
+    // CRLF 文件：匹配在 LF 基准上进行，写回恢复 CRLF。
+    const crlf = await fs.resolve('project/crlf.ts')
+    await fs.writeText(crlf, 'a\r\nb\r\n')
+    const patched = await fs.patchText(crlf, [{ lineNumber: 1, oldLines: ['a', 'b'], newLines: ['a', 'c'], isEndOfFile: false }])
+    expect(patched.after).toBe('a\nc\n')
+    expect(await fs.readText(crlf)).toBe('a\r\nc\r\n')
+
+    // 缺失目标 = FS_STALE_VERSION；版本守卫过期同码。
+    await expect(fs.patchText(await fs.resolve('project/ghost.ts'), [])).rejects.toMatchObject({ code: 'FS_STALE_VERSION' })
+    const observed = (await fs.stat(target))!.version
+    await fs.writeText(target, 'changed\n')
+    await expect(fs.patchText(target, [], { version: observed })).rejects.toMatchObject({ code: 'FS_STALE_VERSION' })
+    await fiber.dispose()
+  })
+
+  it('deleteFile：删除常规文件并返回 LF 基准 before；缺失/目录/版本守卫错误码', async () => {
+    const { fiber, fs } = await setup()
+    const target = await fs.resolve('project/main.ts')
+    const outcome = await fs.deleteFile(target)
+    expect(outcome.before).toBe("console.log('hi')\n")
+    expect(await fs.stat(target)).toBeUndefined()
+    await expect(fs.deleteFile(target)).rejects.toMatchObject({ code: 'FS_STALE_VERSION' })
+    await expect(fs.deleteFile(await fs.resolve('project'))).rejects.toMatchObject({ code: 'FS_NOT_REGULAR_FILE' })
+
+    const other = await fs.resolve('project/other.ts')
+    await fs.writeText(other, 'keep\n')
+    const observed = (await fs.stat(other))!.version
+    await fs.writeText(other, 'changed\n')
+    await expect(fs.deleteFile(other, { version: observed })).rejects.toMatchObject({ code: 'FS_STALE_VERSION' })
+    expect(await fs.readText(other)).toBe('changed\n')
+    await fiber.dispose()
+  })
+
+  it('moveFile：发布目的地（沿用源 mode）后删源；hunks 可选；同目标报 FS_SAME_TARGET', async () => {
+    const { fiber, fs } = await setup()
+    const sftp = fake.state.sftp as unknown as { nodes: Map<string, { kind: string; mode: number }> }
+    sftp.nodes.set('/home/dev/project/movable.ts', {
+      kind: 'file', content: Buffer.from('one\ntwo\n', 'utf8'), mode: 0o640, mtime: 5,
+    })
+    const source = await fs.resolve('project/movable.ts')
+    const destination = await fs.resolve('project/moved.ts')
+    await expect(fs.moveFile(source, source, {})).rejects.toMatchObject({ code: 'FS_SAME_TARGET' })
+
+    const outcome = await fs.moveFile(source, destination, { hunks: [{ lineNumber: 1, oldLines: ['two'], newLines: ['deux'], isEndOfFile: false }] })
+    expect(outcome.sourceDeleted).toBe(true)
+    expect(outcome.sourceBefore).toBe('one\ntwo\n')
+    expect(outcome.destination.operation).toBe('create')
+    expect(outcome.destination.before).toBeNull()
+    expect(outcome.destination.after).toBe('one\ndeux\n')
+    expect(await fs.readText(destination)).toBe('one\ndeux\n')
+    expect(await fs.stat(source)).toBeUndefined()
+    expect(sftp.nodes.get('/home/dev/project/moved.ts')!.mode & 0o777).toBe(0o640)
+    await expect(fs.moveFile(await fs.resolve('project/ghost.ts'), destination, {})).rejects.toMatchObject({ code: 'FS_STALE_VERSION' })
+    await fiber.dispose()
+  })
+
+  it('moveFile：目的地守卫 createIfAbsent 冲突报 FS_NOT_OBSERVED；源删除失败如实报告 sourceDeleted:false', async () => {
+    const { fiber, fs } = await setup()
+    const sftp = fake.state.sftp as unknown as {
+      nodes: Map<string, { kind: string; content: Buffer; mode: number; mtime: number }>
+      unlink(path: string, cb: (err?: Error) => void): void
+    }
+    sftp.nodes.set('/home/dev/project/src.ts', { kind: 'file', content: Buffer.from('src\n', 'utf8'), mode: 0o644, mtime: 7 })
+    const source = await fs.resolve('project/src.ts')
+    const existing = await fs.resolve('project/main.ts')
+    await expect(fs.moveFile(source, existing, { expectedDestination: { kind: 'createIfAbsent' } }))
+      .rejects.toMatchObject({ code: 'FS_NOT_OBSERVED' })
+    // 源未被触碰（守卫在发布前拒绝）。
+    expect(await fs.readText(source)).toBe('src\n')
+
+    // 目的地发布后源删除失败：两阶段结果如实报告，不丢目的地也不谎称已删源。
+    const realUnlink = sftp.unlink.bind(sftp)
+    let failOnce = true
+    sftp.unlink = (path, cb) => {
+      if (failOnce && path === '/home/dev/project/src.ts') { failOnce = false; cb(new Error('Permission denied')); return }
+      realUnlink(path, cb)
+    }
+    const outcome = await fs.moveFile(source, existing, {})
+    expect(outcome.sourceDeleted).toBe(false)
+    expect(outcome.sourceFailure.code).toBe('FS_PERMISSION_DENIED')
+    expect(outcome.destination.operation).toBe('update')
+    expect(await fs.readText(existing)).toBe('src\n')
+    expect(await fs.readText(source)).toBe('src\n')
     await fiber.dispose()
   })
 

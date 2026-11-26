@@ -61,7 +61,7 @@ DSH 的 Agent 跑在本地。当代码、数据或生产环境在远程 Linux �
 
 ## 安装
 
-要求：DSH（web profile）、Node ≥ 22、可连通的 SSH 服务器。
+要求：DSH 0.2.2-rc.5 或更新的 0.2.x（web profile；本 fork 不再兼容 0.1.x / 0.2.0）、Node ≥ 24.9、可连通的 SSH 服务器。
 
 ### 从 npm
 

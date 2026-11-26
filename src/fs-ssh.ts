@@ -16,17 +16,26 @@
  *    remove 是递归的，SSH 的 rmdir 只删空目录，故补一步）。
  * 4. readBytes 双保险用 SFTP 整读 + 事后 size 校验（e2b 用流式中断；SSH 的
  *    readFile 一次性入内存，stat 预检已挡 at-rest 超限，post-stat grower 事后拒绝）。
+ *
+ * dsh 0.2.x 的 FileSystem 基类在上述之外新增抽象成员 readByteRange / patchText /
+ * deleteFile / moveFile（watch 变为基类具体方法）：这里逐一对照官方 fs-local
+ * 的实现语义补齐（hunk 应用复用官方 @deepseek-ai/dsh-fs-patch 的 applyHunks，
+ * 错误码 FS_PATCH_MISMATCH / FS_SAME_TARGET / sourceDeleted 两阶段报告一致）。
  */
 
 import { randomUUID, createHash } from 'node:crypto'
 import { Buffer } from 'node:buffer'
 import { posix } from 'node:path'
+import { applyHunks } from '@deepseek-ai/dsh-fs-patch'
+import type { PatchHunk } from '@deepseek-ai/dsh-fs-patch'
 import { FileSystem, FsError, FsTargetKey, FsVersion } from '@deepseek-ai/dsh-fs'
 import type {
+  FsDeleteOutcome,
   FsDirEntry,
   FsEditOutcome,
   FsEditRequest,
   FsInfo,
+  FsMoveOutcome,
   FsPathInfo,
   FsTarget,
   FsWriteIntent,
@@ -489,10 +498,8 @@ export class SshFileSystem extends FileSystem {
    * 瞬态错误不计失败，连续 WATCH_FAILURE_LIMIT 次才 changed(error) 上报并
    * 自停（订阅方会回退到今天的 watch-unsupported 行为）。
    */
-  // NOTE: 不加 override —— 本仓库 devDeps 的 dsh-fs 0.1.1 类型未声明 watch
-  // （0.2.0 运行时的基类才有）；此处作为新方法声明，运行时遮蔽 0.2.0 基类
-  // 的默认拒绝实现。
-  async watch(
+  // 0.2.x 起 dsh-fs 基类声明了具体 watch（默认拒绝）；此处 override 遮蔽它。
+  override async watch(
     target: FsTarget,
     changed: (error?: Error) => void,
     signal: AbortSignal,
@@ -550,6 +557,45 @@ export class SshFileSystem extends FileSystem {
     return async () => { stop() }
   }
 
+  // ---------------------------------------------------------------- read
+
+  /**
+   * 字节窗口读取（0.2.x 抽象成员）：stat 预检（走微缓存）后按窗口流式读取，
+   * 窗口即上界——offset 越过文件末尾返回空，不缓冲整文件。
+   */
+  override async readByteRange(
+    target: FsTarget,
+    range: { offset: number; length: number },
+    signal?: AbortSignal,
+  ): Promise<Uint8Array> {
+    assertNotAborted(signal, 'read')
+    await this.requireRegular(target, signal)
+    if (range.length <= 0) return new Uint8Array(0)
+    const key = String(target.targetKey)
+    try {
+      const sftp = await (await this.connectionFor()).getSftp()
+      const chunks: Buffer[] = []
+      const stream = sftp.createReadStream(key, { start: range.offset, end: range.offset + range.length - 1 })
+      const onAbort = (): void => { stream.destroy(new FsError('read aborted', 'FS_ABORTED')) }
+      signal?.addEventListener('abort', onAbort, { once: true })
+      if (signal?.aborted === true) onAbort()
+      try {
+        await new Promise<void>((resolve, reject) => {
+          stream.on('data', (chunk: Buffer) => chunks.push(chunk))
+          stream.on('end', () => { resolve() })
+          stream.on('error', reject)
+        })
+      } finally {
+        signal?.removeEventListener('abort', onAbort)
+      }
+      assertNotAborted(signal, 'read')
+      const buffer = Buffer.concat(chunks)
+      return new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength)
+    } catch (error: unknown) {
+      throw mapError(error, 'read', target.displayPath, signal)
+    }
+  }
+
   // ---------------------------------------------------------------- write
 
   override async writeText(
@@ -560,26 +606,8 @@ export class SshFileSystem extends FileSystem {
     _sandboxPolicy?: SandboxExecutionPolicy,
   ): Promise<FsWriteOutcome> {
     return this.withLock(String(target.targetKey), async () => {
-      const existing = await this.probe(String(target.targetKey), target.displayPath, signal)
-      if (existing !== undefined && entryType(existing) !== 'file') {
-        throw new FsError(`cannot write "${target.displayPath}": not a regular file`, 'FS_NOT_REGULAR_FILE')
-      }
-      this.checkWriteIntent(existing, expected, target)
-      const before = existing === undefined ? null : await this.readForDiff(target, signal)
-      const version = await this.writeAtomic(
-        target,
-        content,
-        existing,
-        expected?.kind === 'createIfAbsent',
-        signal,
-      )
-      this.statCache.delete(String(target.targetKey))
-      return {
-        operation: existing === undefined ? 'create' : 'update',
-        version,
-        before,
-        after: normalizeLineEndings(content),
-      }
+      const existing = await this.writableTarget(target, expected, signal)
+      return this.publishWrite(target, content, existing, expected, signal)
     })
   }
 
@@ -591,16 +619,7 @@ export class SshFileSystem extends FileSystem {
     _sandboxPolicy?: SandboxExecutionPolicy,
   ): Promise<FsEditOutcome> {
     return this.withLock(String(target.targetKey), async () => {
-      const existing = await this.probe(String(target.targetKey), target.displayPath, signal)
-      if (existing === undefined) {
-        throw new FsError(`cannot edit "${target.displayPath}": file changed since it was read`, 'FS_STALE_VERSION')
-      }
-      if (entryType(existing) !== 'file') {
-        throw new FsError(`cannot edit "${target.displayPath}": not a regular file`, 'FS_NOT_REGULAR_FILE')
-      }
-      if (expected !== undefined && entryVersion(String(target.targetKey), existing) !== expected.version) {
-        throw new FsError(`cannot edit "${target.displayPath}": file changed since it was read`, 'FS_STALE_VERSION')
-      }
+      const existing = await this.requireFile(target, expected, 'edit', signal)
       const raw = await this.readForEdit(target, signal)
       const before = normalizeLineEndings(raw)
       const after = literalEdit(before, edit, target.displayPath)
@@ -608,6 +627,96 @@ export class SshFileSystem extends FileSystem {
       const version = await this.writeAtomic(target, storage, existing, false, signal)
       this.statCache.delete(String(target.targetKey))
       return { version, before, after }
+    })
+  }
+
+  override async patchText(
+    target: FsTarget,
+    hunks: readonly PatchHunk[],
+    expected?: { version: FsVersion },
+    signal?: AbortSignal,
+    _sandboxPolicy?: SandboxExecutionPolicy,
+  ): Promise<FsEditOutcome> {
+    return this.withLock(String(target.targetKey), async () => {
+      const existing = await this.requireFile(target, expected, 'patch', signal)
+      const raw = await this.readForEdit(target, signal)
+      const before = normalizeLineEndings(raw)
+      const after = this.patchContent(target, before, hunks)
+      const storage = restoreLineEndings(after, detectsCrlf(raw))
+      const version = await this.writeAtomic(target, storage, existing, false, signal)
+      this.statCache.delete(String(target.targetKey))
+      return { version, before, after }
+    })
+  }
+
+  override async deleteFile(
+    target: FsTarget,
+    expected?: { version: FsVersion },
+    signal?: AbortSignal,
+    _sandboxPolicy?: SandboxExecutionPolicy,
+  ): Promise<FsDeleteOutcome> {
+    return this.withLock(String(target.targetKey), async () => {
+      await this.requireFile(target, expected, 'delete', signal)
+      const before = await this.readForDiff(target, signal)
+      assertNotAborted(signal, 'delete')
+      const key = String(target.targetKey)
+      try {
+        const sftp = await (await this.connectionFor()).getSftp()
+        await sftpCallVoid((cb) => sftp.unlink(key, cb))
+      } catch (error: unknown) {
+        throw mapError(error, 'delete', target.displayPath, signal)
+      }
+      this.statCache.delete(key)
+      return { before }
+    })
+  }
+
+  override async moveFile(
+    source: FsTarget,
+    destination: FsTarget,
+    options: {
+      hunks?: readonly PatchHunk[];
+      expectedSource?: { version: FsVersion };
+      expectedDestination?: FsWriteIntent;
+    },
+    signal?: AbortSignal,
+    _sandboxPolicy?: SandboxExecutionPolicy,
+  ): Promise<FsMoveOutcome> {
+    const sourceKey = String(source.targetKey)
+    const destinationKey = String(destination.targetKey)
+    if (sourceKey === destinationKey) {
+      throw new FsError(`cannot move "${source.displayPath}" to itself`, 'FS_SAME_TARGET')
+    }
+    // 两把锁按规范序获取、逆序释放（与官方 moveFile 的 canonical order 一致）。
+    return this.withLocks([sourceKey, destinationKey], async () => {
+      const existingSource = await this.requireFile(source, options.expectedSource, 'move', signal)
+      const existingDestination = await this.writableTarget(destination, options.expectedDestination, signal)
+      const raw = await this.readForEdit(source, signal)
+      const sourceBefore = normalizeLineEndings(raw)
+      const after = options.hunks === undefined ? sourceBefore : this.patchContent(source, sourceBefore, options.hunks)
+      const storage = restoreLineEndings(after, detectsCrlf(raw))
+      assertNotAborted(signal, 'move')
+      // 自此检查点起两个效果都要完成并如实报告（取消不再回滚）。目的地的
+      // mode 与行尾风格沿用源文件（契约：source 的 line-ending style and
+      // mode carry over）。
+      const outcome = await this.publishWrite(
+        destination,
+        storage,
+        existingDestination,
+        options.expectedDestination,
+        undefined,
+        existingSource,
+      )
+      try {
+        const sftp = await (await this.connectionFor()).getSftp()
+        await sftpCallVoid((cb) => sftp.unlink(sourceKey, cb))
+      } catch (error: unknown) {
+        // 目的地已发布：源删除失败作为最终结果如实报告（sourceDeleted:false）。
+        const failure = mapError(error, 'move', source.displayPath, signal)
+        return { sourceBefore, destination: outcome, sourceDeleted: false, sourceFailure: { code: failure.code, message: failure.message } }
+      }
+      this.statCache.delete(sourceKey)
+      return { sourceBefore, destination: outcome, sourceDeleted: true }
     })
   }
 
@@ -623,6 +732,87 @@ export class SshFileSystem extends FileSystem {
       return await run
     } finally {
       if (this.locks.get(targetKey) === tail) this.locks.delete(targetKey)
+    }
+  }
+
+  /** 多把锁按规范序逐层获取（内层先释放；顺序一致故无死锁）。 */
+  private async withLocks<T>(targetKeys: readonly string[], operation: () => Promise<T>): Promise<T> {
+    const nested = [...new Set(targetKeys)].sort()
+      .reduceRight((inner: () => Promise<T>, key) => () => this.withLock(key, inner), operation)
+    return nested()
+  }
+
+  /**
+   * 写入目标的预检：不存在或非普通文件、意图守卫（createIfAbsent 拒绝已存在，
+   * replaceIfVersion 拒绝缺失/版本不符）。返回现存条目（缺失 = undefined）。
+   */
+  private async writableTarget(
+    target: FsTarget,
+    expected: FsWriteIntent | undefined,
+    signal?: AbortSignal,
+  ): Promise<Stats | undefined> {
+    const existing = await this.probe(String(target.targetKey), target.displayPath, signal)
+    if (existing !== undefined && entryType(existing) !== 'file') {
+      throw new FsError(`cannot write "${target.displayPath}": not a regular file`, 'FS_NOT_REGULAR_FILE')
+    }
+    this.checkWriteIntent(existing, expected, target)
+    return existing
+  }
+
+  /** 编辑/补丁/删除/移动源的预检：缺失 → FS_STALE_VERSION，非文件 → FS_NOT_REGULAR_FILE，版本守卫。 */
+  private async requireFile(
+    target: FsTarget,
+    expected: { version: FsVersion } | undefined,
+    verb: string,
+    signal?: AbortSignal,
+  ): Promise<Stats> {
+    const existing = await this.probe(String(target.targetKey), target.displayPath, signal)
+    if (existing === undefined) {
+      throw new FsError(`cannot ${verb} "${target.displayPath}": file changed since it was read`, 'FS_STALE_VERSION')
+    }
+    if (entryType(existing) !== 'file') {
+      throw new FsError(`cannot ${verb} "${target.displayPath}": not a regular file`, 'FS_NOT_REGULAR_FILE')
+    }
+    if (expected !== undefined && entryVersion(String(target.targetKey), existing) !== expected.version) {
+      throw new FsError(`cannot ${verb} "${target.displayPath}": file changed since it was read`, 'FS_STALE_VERSION')
+    }
+    return existing
+  }
+
+  /** 官方 applyHunks 的错误码映射（未命中的 hunk → FS_PATCH_MISMATCH）。 */
+  private patchContent(target: FsTarget, before: string, hunks: readonly PatchHunk[]): string {
+    const result = applyHunks(before, hunks)
+    if (!result.ok) {
+      throw new FsError(
+        `cannot patch "${target.displayPath}": hunk at patch line ${result.failure.hunkLineNumber} (${result.failure.stage}) does not match`,
+        'FS_PATCH_MISMATCH',
+      )
+    }
+    return result.after
+  }
+
+  /**
+   * 发布一次写入（writeText 与 moveFile 的目的地共用）：差异基准读取 → 原子写
+   * → 缓存失效。`modeFrom` 给定时沿用源文件的 mode（move），否则新建 0600 /
+   * 沿用目标既有 mode。
+   */
+  private async publishWrite(
+    target: FsTarget,
+    content: string,
+    existing: Stats | undefined,
+    expected: FsWriteIntent | undefined,
+    signal?: AbortSignal,
+    modeFrom?: Stats,
+  ): Promise<FsWriteOutcome> {
+    const key = String(target.targetKey)
+    const before = existing === undefined ? null : await this.readForDiff(target, signal)
+    const version = await this.writeAtomic(target, content, modeFrom ?? existing, expected?.kind === 'createIfAbsent', signal)
+    this.statCache.delete(key)
+    return {
+      operation: existing === undefined ? 'create' : 'update',
+      version,
+      before,
+      after: normalizeLineEndings(content),
     }
   }
 

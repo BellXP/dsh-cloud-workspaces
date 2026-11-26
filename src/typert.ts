@@ -17,7 +17,8 @@
 import { Service } from '@deepseek-ai/cordis'
 import type { Context } from '@deepseek-ai/cordis'
 import { bindTypertRemote } from '@deepseek-ai/dsh-typert-protocol'
-import type { TypertCodec } from '@deepseek-ai/dsh-typert-protocol'
+import type { InvocationDescriptor, TypertCodec } from '@deepseek-ai/dsh-typert-protocol'
+import type { TypertContribution } from '@deepseek-ai/dsh-typert-registry'
 import type { SshRuntime } from './ssh-service'
 import type { SshHostConfig } from './host-settings'
 import type { HostPayload } from './protocol'
@@ -38,16 +39,8 @@ export const REMOTE_NAMESPACE = 'ssh-remote'
 
 const SRC_JSON: TypertCodec = { mode: 'src-json' }
 
-/** 一个 host 半 invocation 描述符（strict local 注册表形状）。 */
-export interface HostInvocation {
-  id: string
-  service: string
-  namespace: string
-  method: string
-  invocation: { kind: 'direct' }
-  parameters: Array<{ name: string; wire: string; source: 'json'; codec: TypertCodec }>
-  result: TypertCodec
-}
+/** 一个 host 半 invocation 描述符（官方 InvocationDescriptor；direct 调用、json 参数、src-json 结果）。 */
+export type HostInvocation = InvocationDescriptor
 
 function hostInvocation(method: string, parameters: string[]): HostInvocation {
   return {
@@ -69,17 +62,17 @@ function hostInvocation(method: string, parameters: string[]): HostInvocation {
  */
 export { jsonSafe } from './jsonsafe'
 
-/** host 半贡献（ctx.typert.register 消费；face:'host' + invocations）。 */
-export interface HostTypertContribution {
-  package: string
-  face: 'host'
-  schemas: unknown[]
-  invocations: HostInvocation[]
-  model: undefined
-}
+/**
+ * host 半贡献（ctx.typert.register 消费；face:'host' + invocations）。
+ * 0.2.2：类型直接取官方 TypertContribution——@deepseek-ai/dsh-typert-registry
+ * 已在 TypertRegistryContract 上声明 register 的正式签名，本地声明合并随之
+ * 删除；本插件没有生成反射，model 给空模型（registry 原样存档，不再注入
+ * undefined）。
+ */
+const EMPTY_MODEL: TypertContribution['model'] = { services: [], events: [], objects: [] }
 
 /** host 半贡献：参数名（wire）与 SshRemoteService 方法参数一一对应。 */
-export const HOST_TYPERT_CONTRIBUTION: HostTypertContribution = {
+export const HOST_TYPERT_CONTRIBUTION: TypertContribution = {
   package: REMOTE_PACKAGE,
   face: 'host',
   schemas: [],
@@ -95,14 +88,7 @@ export const HOST_TYPERT_CONTRIBUTION: HostTypertContribution = {
     hostInvocation('listPlaceholders', []),
     hostInvocation('refreshLoginEnv', ['hostId']),
   ],
-  model: undefined,
-}
-
-/** 类型扩展：TypertRegistryContract 未导出 register，运行时存在。 */
-declare module '@deepseek-ai/dsh-typert-protocol' {
-  interface TypertRegistryContract {
-    register(contribution: HostTypertContribution): () => void
-  }
+  model: EMPTY_MODEL,
 }
 
 /**

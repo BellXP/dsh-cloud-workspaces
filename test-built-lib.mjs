@@ -15,9 +15,16 @@ import path from 'node:path'
 import assert from 'node:assert/strict'
 import { connectHttpProxy, routeFsPath, placeholderKeyFor, mapLocalTreeToRemote } from './lib/index.js'      // stable public re-export
 import { readdirSync } from 'node:fs'
-// HostStore lives in the hashed engine chunk — resolve it by pattern.
-const engineChunk = readdirSync('./lib').find((f) => /^engine-.*\.js$/.test(f))
-const { i: HostStore } = await import(`./lib/${engineChunk}`)
+// HostStore lives in a hashed shared chunk (engine + store + debug-log). Its file
+// name and minified export alias both drift between builds, so resolve the class by
+// its preserved `name` across the non-entry chunks instead of guessing either.
+const ENTRY_FILES = new Set(['index.js', 'tools.js', 'job-runner.js', 'fs-ssh.js', 'ssh-service.js', 'subprocess-ssh.js'])
+let HostStore
+for (const file of readdirSync('./lib').filter((f) => f.endsWith('.js') && !ENTRY_FILES.has(f))) {
+  const mod = await import(`./lib/${file}`)
+  HostStore ??= Object.values(mod).find((v) => typeof v === 'function' && v.name === 'HostStore')
+}
+if (!HostStore) throw new Error('HostStore class not found in any lib chunk')
 
 const listen = (server) => new Promise((r) => server.listen(0, '127.0.0.1', () => r(server.address().port)))
 

@@ -14,7 +14,10 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import type { JobRegistry } from '@deepseek-ai/dsh-jobs'
-import z from 'schemastery'
+// 0.2.2：DSH 树只发布 @deepseek-ai/schemastery（3.19.0），裸名 `schemastery`
+// 包已不存在——import 说明符随之改为 scoped 形式（打包行为不变：仍由 tsdown
+// 内联，不进 external）。
+import z from '@deepseek-ai/schemastery'
 import type {} from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-system-prompt'
 import SshRuntime from './ssh-service'

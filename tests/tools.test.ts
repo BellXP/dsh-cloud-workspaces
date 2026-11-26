@@ -135,6 +135,16 @@ describe('ssh_exec run_in_background', () => {
     expect(out).toEqual({ kind: 'background', jobId: 'ssh-2' })
     expect(exec).not.toHaveBeenCalled()
     expect(started[0]).toMatchObject({ kind: 'ssh', label: 'sleep 100' })
+    // 无归属 agent = 无主 job（spec 不带 owner 键）。
+    expect(Object.hasOwn(started[0] as object, 'owner')).toBe(false)
+  })
+
+  it('归属会话：owner = exec.agent.id（0.2.x JobSpec.owner 是 SessionId，不是 agent 本体）', async () => {
+    const started: unknown[] = []
+    const jobs = { start: (s: unknown) => { started.push(s); return 'ssh-4' } }
+    const tool = sshExecTool(stubRuntime(), jobs as never)
+    await tool.execute({ command: 'sleep 100', run_in_background: true }, { agent: { id: 'session-42' as never } })
+    expect(started[0]).toMatchObject({ owner: 'session-42' })
   })
 
   it('render：background 结果渲染 started 文案', () => {

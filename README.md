@@ -63,7 +63,7 @@ DSH's agent runs on your local machine. When your code, data or production box l
 
 ## Install
 
-Requires DSH (web profile), Node ≥ 22, and a reachable SSH server.
+Requires DSH 0.2.2-rc.5 or newer 0.2.x (web profile; this fork no longer loads on 0.1.x / 0.2.0), Node ≥ 24.9, and a reachable SSH server.
 
 ### From npm
 

@@ -32,9 +32,9 @@ import type { FileHandle } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { posix } from 'node:path'
-import { PassThrough, Writable } from 'node:stream'
+import { Duplex, PassThrough, Writable } from 'node:stream'
 import { Context } from '@deepseek-ai/cordis'
-import z from 'schemastery'
+import z from '@deepseek-ai/schemastery'
 import { SENSITIVE_ENV_PATTERN, SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
 import type {
   SubprocessCollect,
@@ -45,6 +45,7 @@ import type {
   SubprocessOutputRead,
   SubprocessOutputReader,
   SubprocessSpawnSpec,
+  SubprocessTerminalEnvironment,
   SubprocessTerminalForeground,
   SubprocessTerminalHandle,
   SubprocessTerminalSignal,
@@ -398,6 +399,12 @@ export class SshSubprocessHandle implements SubprocessHandle {
   readonly stdin: Writable | undefined
   readonly stdout: PassThrough | undefined
   readonly stderr: PassThrough | undefined
+  /**
+   * 0.2.x seam member：请求的独立字节控制通道。SSH 适配器没有这个载体——
+   * spawn 对 `stdio.control === 'pipe'` 的 spec 同步拒绝，所以这里恒为
+   * undefined（接口允许启动失败时缺席）。
+   */
+  readonly control: Duplex | undefined = undefined
   readonly collected: SubprocessCollectedOutputs
   readonly done: Promise<SubprocessOutcome>
 
@@ -1459,12 +1466,32 @@ export class SshSubprocessRuntime extends SubprocessRuntime {
     return posix.resolve(home, executable)
   }
 
+  /**
+   * 0.2.x seam member：终端 shell 选择事实。远端世界恒为 posix；defaultShell
+   * 取该主机登录 shell（getent passwd 第 7 字段），一次只读探测，失败则
+   * 省略——消费者回退自己的默认 shell 列表。
+   */
+  async terminalEnvironment(signal?: AbortSignal): Promise<SubprocessTerminalEnvironment> {
+    signal?.throwIfAborted()
+    const connection = await this.ctx.ssh.getConnection()
+    const result = await connection.exec(
+      bashCommand('dsh_shell="$(getent passwd "$(id -u)" | cut -d: -f7)"; printf \'%s\' "$dsh_shell"'),
+      { timeoutMs: 10_000 },
+    )
+    signal?.throwIfAborted()
+    const defaultShell = result.success ? result.stdout.trim() : ''
+    return { platform: 'posix', ...(defaultShell !== '' ? { defaultShell } : {}) }
+  }
+
   /** @inheritdoc */
   spawn(spec: SubprocessSpawnSpec): SubprocessHandle {
     if (this.disposing) throw new Error('subprocess-ssh: service is disposing')
     const program = spec.argv[0]
     if (program === undefined || program.length === 0) {
       throw new Error('invalid argv: expected a non-empty program name at argv[0]')
+    }
+    if (spec.stdio.control === 'pipe') {
+      throw new Error('subprocess-ssh: a separate control channel (stdio.control) is not supported over SSH')
     }
     requireRepresentableGrace(spec.graceMs)
     if (spec.signal?.aborted === true) {

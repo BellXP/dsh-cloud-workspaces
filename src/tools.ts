@@ -14,7 +14,7 @@ import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { JobRegistry } from '@deepseek-ai/dsh-jobs'
 import type { ExecResult, RemoteDirEntry, SshHostSummary } from './protocol'
 import type { SshRuntime } from './ssh-service'
-import { startRemoteJob } from './job-runner'
+import { jobOwnerOf, startRemoteJob, type JobExecLike } from './job-runner'
 import { createPlaceholderDir, listPlaceholders } from './workspace'
 import { jsonSafe } from './jsonsafe'
 
@@ -185,14 +185,14 @@ export function sshExecTool(runtime: SshRuntime, jobs: JobRegistry | undefined) 
         return text(renderExec(value as Parameters<typeof renderExec>[0]))
       },
     },
-    async execute(args: { command: string; alias?: string; timeoutMs?: number; run_in_background?: boolean }, exec?: { agent?: unknown }) {
+    async execute(args: { command: string; alias?: string; timeoutMs?: number; run_in_background?: boolean }, exec?: JobExecLike) {
       const alias = resolveAlias(runtime, args.alias)
       if (args.run_in_background === true) {
-        // 后台无 cwd 参数（连接默认目录=远端 home）；owner 透传 exec.agent。
+        // 后台无 cwd 参数（连接默认目录=远端 home）；owner = 归属会话 id。
         return jsonSafe(startRemoteJob({ engine: runtime.engine, jobs }, {
           hostId: alias,
           command: args.command,
-          ...(exec?.agent !== undefined ? { agent: exec.agent as never } : {}),
+          ...jobOwnerOf(exec),
         }))
       }
       const result = await runtime.engine.exec(alias, args.command, { timeoutMs: args.timeoutMs })

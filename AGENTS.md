@@ -60,7 +60,7 @@ pnpm watch            # tsdown watch
 ### 运行与验证
 
 ```powershell
-# 推荐：本机已全局安装 dsh 0.1.1-rc.2，直接起（秒级）
+# 推荐：本机已全局安装 dsh 0.2.2-rc.5（Node 24），直接起（秒级）
 dsh web --port 4500
 # 或一键脚本（内部 npx @deepseek-ai/dsh@latest 每次重新下载，慢网络下 5 分钟装不完）
 powershell -ExecutionPolicy Bypass -File .\scripts\start-dsh-web.ps1
@@ -78,7 +78,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-dsh-web.ps1
 - **工具注册**：`ctx.tools.register(defineTool({...}))`（`@deepseek-ai/dsh-tools`）；schema 自动进 system prompt；输出 schema 的类型会推导 execute 返回类型——注意 `exitCode: null` vs `undefined` 的对齐（见 tools.ts 的转换）。
 - **会话遮蔽工具**：订阅走 **`ctx.on('agent/created', cb)`** 事件总线（AgentRegistry 服务上没有 on）；遮蔽工具只能注册进 `payload.agent.ctx`（agent scope）——**绝不退回插件级 ctx**（会全局遮蔽本地会话的官方工具）；钩子整体吞异常，绝不阻塞会话创建。
 - **富 UI 视图**：官方 UI 对 `bash`/`read` 等名字走 keyed `tool.call.toolview` 行，仅当工具定义实现 **`presentCall`/`presentResult`**（terminal/read/search 等视图，类型见 dsh-tools presentation.d.ts）时行才可展开；不实现则整行 inert（2026-08-31 真机踩过）。
-- **可选服务用 `ctx.get()`**；注册皆 effect（`ctx.effect`）；`./invariant` 子路径必带。
+- **可选服务用 `ctx.get()`**；注册皆 effect（`ctx.effect`）。`./invariant` 子路径已随 dsh 0.2.0-rc.2 移除运行时不变量注册表而删除（v0.10.0），不再需要。
+- **dsh 0.2.2-rc.5 契约（v0.10.0 适配，详见 FORK.md 17）**：ToolRuntime 自身不执行（全链路探针需挂 `dsh-tool-executor-native`）；后台 job 归属传 `exec.agent.id`（`JobSpec.owner: SessionId`），日志走 `JobOutputSource` 拉源（`JobHooks.readOutput` 已删）；`fs` 适配器须实现 `readByteRange/patchText/deleteFile/moveFile`；`subprocess` 适配器须实现 `terminalEnvironment`；client 本机目录选择经 `ctx.get('uiWorkspace').pickDirectory()`，工作区选择器三洞（含 `workspace.picker.directoryFlow`）同占；schemastery 只剩 `@deepseek-ai/schemastery`。
 - **host 依赖 external**（tsdown `external`）：`@deepseek-ai/*` 运行时从 profile 解析，不打包。
 - **主题**：若未来加 UI，用 `--dsw-*` token（DSH 官方设计体系），明暗自适应用**成对 token**（fill + label-primary-foreground），不要自创配色/emoji。
 
@@ -108,7 +109,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-dsh-web.ps1
 
 ## 参考资料（本地）
 
-- DSH 源码：`.research/dsh-source/deepseek-harness-master/`（**rc.5 旧版，仅历史参考；契约以 npm 0.1.1-rc.2 的 d.ts 为准**）
+- DSH 契约以**安装树 0.2.2-rc.5 的 d.ts 为准**：`%APPDATA%\npm\node_modules\@deepseek-ai\dsh\node_modules\@deepseek-ai\<pkg>\lib\types\*.d.ts`（README 为权威说明），升级指南在同树 `dsh\docs\upgrade-guide\README.md`；`.research/dsh-source/`（rc.5 旧版）仅历史参考。
 - 官方文档：`docs/user/develop/`（插件开发）+ `docs/cookbook/`（extension-cookbook、adding-a-tool）
 - 项目记忆：`memory/`（进度/反馈/踩坑/参考）
 - 竞品（2026-08-28 调研）：`dsh-ssh/dsh-ssh`（工具层遮蔽路由）、`CrazyShout/dsh-ssh-remote`（服务层 monkey-patch）、`flymysql/dsh-remote`（SFTP 镜像）

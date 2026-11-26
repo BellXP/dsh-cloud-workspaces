@@ -23,6 +23,9 @@ dsh plugin --profile web add link:C:\Users\x00968307\dsh-cloud-workspaces
 
 ## What this fork is
 
+> **Current target: dsh 0.2.2-rc.5 (v0.10.0)** — see change 17 below. The paragraphs that
+> follow describe the original 0.1.7 / 0.2.0-rc.2 adaptation and are kept as history.
+
 Upstream: `dsh-cloud-workspaces` v0.3.0 (github.com/harryopo/dsh-cloud-workspaces, Apache-2.0),
 running against **dsh 0.2.0-rc.2** (also loads on 0.1.7-rc.2 — the peer ranges span both). 0.2.0
 added a plugin compatibility gate (`dsh-app-boot` checks every `@deepseek-ai/dsh*` peerDependency
@@ -250,6 +253,90 @@ applyable with `git apply` onto a fresh upstream clone). Summary of the changes:
       dsh-attachment/dsh-code-runtime/dsh-session/dsh-session-persistence/dsh-storage/
       dsh-storage-domain/dsh-user-approval/cordis-plugin-include/cordis-plugin-loader）——
       pnpm 的 auto-install-peers 在 Windows 上掩盖了纯净 npm 安装的缺口。
+17. **dsh 0.2.2-rc.5 compatibility** (2026-11-26, v0.10.0) — the fork was last adapted to
+    0.2.0-rc.2 (devDeps pinned 0.1.1-rc.2); this release re-targets **0.2.2-rc.5** (Node 24).
+    Every change below is driven by a `tsc` error, a red test, or a named upgrade guide;
+    behavior of the SSH engine, HTTP CONNECT proxy, jump hosts, remote sidebar seams,
+    persistent session shell, ssh_* tools, settings card and workspace picker is unchanged.
+    - **Removed surfaces**: `@deepseek-ai/dsh-invariants` and every `./invariant` subpath are
+      gone (guide `v0.2.0-rc.2/remove-runtime-invariants`) — `src/invariant.ts`, the
+      `./invariant` export, the tsdown entry and the devDependency were deleted; no
+      `cordis.patch.yml` / agent-preset row named a `/invariant` module. `@deepseek-ai/dsh-code-runtime`
+      no longer ships (devDep dropped). The bare `schemastery` package is gone from the tree too:
+      DSH now publishes it as `@deepseek-ai/schemastery@3.19.0` (imports switched in
+      `index.ts`, `ssh-service.ts`, `subprocess-ssh.ts`, `host-settings.ts`; still bundled by tsdown,
+      exactly as before).
+    - **package.json**: `version` 0.10.0; `engines.node` `>=24.9.0` (guide `v0.2.1-rc.2/node-24`);
+      every `@deepseek-ai/dsh-*` devDependency pinned to `0.2.2-rc.5`, `@deepseek-ai/cordis` 4.1.0,
+      `cordis-plugin-include`/`-loader` 1.1.0; new devDeps `dsh-fs-patch`, `dsh-typert-registry`
+      (type-only), `dsh-tool-executor-native` (contract probe), plus the peer-only packages the
+      0.2.2 packages require (`dsh-error`, `dsh-http-proxy`, `dsh-session-projection`, `dsh-util-values`)
+      so a clean `npm install --legacy-peer-deps` still resolves. Peers stay peer-based (no
+      `engines.dsh`, guide `v0.2.1-alpha.3/plugin-engines-dsh`): the eight `dsh-*` peers are
+      `>=0.2.2-rc.5 <0.3.0-0`, plus one new peer `@deepseek-ai/dsh-fs-patch` (consumed at runtime by
+      the legacy `fs-ssh` adapter's `patchText`, so it must resolve from the profile).
+    - **`@deepseek-ai/dsh-fs`** (`FileSystem` grew four abstract members and made `watch`
+      concrete): `src/fs-ssh.ts` now implements `readByteRange` (SFTP window stream),
+      `patchText` (official `applyHunks` from `dsh-fs-patch`, `FS_PATCH_MISMATCH`), `deleteFile`
+      (`FsDeleteOutcome.before`) and `moveFile` (both locks in canonical order, `FS_SAME_TARGET`,
+      two-phase `sourceDeleted`/`sourceFailure` reporting, source mode + line endings carried
+      over), mirroring `dsh-fs-local`; `watch` carries `override`. The write path was factored
+      into `writableTarget`/`requireFile`/`publishWrite` shared by `writeText` and `moveFile`.
+    - **`@deepseek-ai/dsh-subprocess`**: `SubprocessRuntime` gained abstract `terminalEnvironment`
+      (implemented as a `getent passwd` login-shell probe → `{ platform: 'posix', defaultShell? }`)
+      and `SubprocessHandle` gained `control` (SSH has no such carrier: `spawn` rejects a spec
+      requesting `stdio.control === 'pipe'` loudly instead of silently leaving it absent).
+    - **`@deepseek-ai/dsh-jobs`** (guides `v0.2.1-alpha.1/job-id-identity`): `JobHooks.readOutput`
+      is gone and `JobStart` is now `JobSpec` — `src/job-runner.ts` feeds the remote log through
+      a `JobOutputSource` (`output: [log]`) that the registry pumps at its own cadence
+      (`read(fromByte)` → `{ text, nextOffset, lossy }`), fetched with
+      `tail -c +N | head -c 64KiB | base64 -w0` on an exact byte cursor (the 0.1.x `dd` block
+      alignment silently skipped the remainder of a not-yet-full block; base64 keeps the cursor
+      byte-exact past the exec channel's UTF-8 decoding), UTF-8 continuation offsets land on
+      character boundaries, delivered bytes are trimmed locally, and a final drain before
+      `done` settles keeps the process's last ≤3 s of output. `JobSpec.owner` is a `SessionId`
+      now: the tools pass `exec.agent.id` (official `dsh-tool-bash` pattern) instead of the
+      agent object (`jobOwnerOf`).
+    - **`@deepseek-ai/dsh-typert-protocol` / `-registry`**: `TypertRegistryContract.register`
+      is officially declared by `dsh-typert-registry` — the local declaration merge was deleted,
+      the host contribution is typed as the official `TypertContribution` and carries an empty
+      `model` (`{ services: [], events: [], objects: [] }`) instead of `undefined`. The strict-codec
+      client contract (`$mount`, `requireStrictInputs`, `remote.<ns>` services) is unchanged.
+    - **Tool execution** (guide `v0.2.1-rc.2/tool-executor-plugins`): `ToolRuntime` no longer
+      executes on its own — the contract probe's full-chain check now mounts
+      `@deepseek-ai/dsh-tool-executor-native` and drives the batch `calls[]` shape; `defineTool`,
+      `presentCall`/`presentResult`/`presentationMeta` and the `meta.diffs` result contract are
+      unchanged. Guide `v0.2.1-rc.2/conditional-tools` does not touch this plugin (no
+      `system-prompt/assemble` listener; the dynamic session section is a plain text provider).
+    - **Client half** (`client/index.js`, verified against the live slot catalog in
+      `dsh-cordis-client-runner/src/client/slot-catalog.ts` and the owning packages):
+      `settings.section`, `conversation.hero.workspace.directoryFlow`,
+      `sidebar.workspaces.directoryFlow`, `sidebar.right.tab.document.actions` (owner
+      `{ absolutePath }`), `tool.call.toolview` keys `edit`/`write`, the composer face
+      (`input.for` → `insertText` + `draftRev`, `setDraft`, `focus`), `sessions.list` /
+      `retainedBy.mainView` / `scope()`, `workspaces.rename`, `remote.$mount`/`$on`,
+      `settings/document-updated` and the `PathLabel` DOM marker `data-path-label` all still
+      exist. Two real changes: (a) the native directory picker moved from the `workspaces` face to
+      the `uiWorkspace` service — `pickDirectory` now reads `ctx.get('uiWorkspace')` with the old
+      face and the raw `remote.directoryPicker` RPC as fallbacks; (b) ui-workspace declares a
+      third directory-flow hole, `workspace.picker.directoryFlow` (Factory `workspace.picker`,
+      used by other plugins' surfaces) — the picker is registered there too (same component,
+      `priority: -100`, the SlotCore's documented way to shadow a shipped occupant), matching
+      the official directory-picker packages that occupy all three holes. Guide
+      `v0.2.1-rc.3/web-file-downloads` concerns file-action menus only (none here); the
+      context-menu / css-anchor / timer guides touch no surface this plugin uses.
+    - **Contract probe** (`scripts/check-dsh-contract.mjs`, 30 → 49 checks): the executor
+      assembly above, quote-insensitive `edit`/`write` key probe (the dist now uses template
+      literals), `PathLabel` re-anchored to its real home (the `data-path-label` DOM contract in
+      the `dsh-web-frontend` dist; the primitives package is no longer shipped separately), and
+      new probes for the 0.2.2 surfaces the plugin now implements (fs abstract members,
+      `terminalEnvironment`/`control`, `JobSpec.output`/`owner`, `TypertContribution`,
+      `workspace.picker.directoryFlow`, `uiWorkspace.pickDirectory`, api-gateway `$mount`/`$on`).
+      Result: devDeps tree 49/49 (22 client SKIPs), full 0.2.2-rc.5 tree 49/49.
+    - **Not verified here** (needs the live host): actual client rendering of the settings card /
+      picker in the three holes, and real SSH terminals. `test-built-lib.mjs` (5 runtime checks)
+      passes on the built `lib/`; it now locates the `HostStore` chunk by class name because the
+      shared chunk is no longer named `engine-*`.
 
 ## Rebuild (after editing src/ — client/index.js needs no build)
 

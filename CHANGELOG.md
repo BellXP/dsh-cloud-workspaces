@@ -2,6 +2,25 @@
 
 All notable changes to `dsh-cloud-workspaces` are documented here.
 
+## [v0.10.0] — 2026-11-26
+
+### Changed
+- **Targets dsh 0.2.2-rc.5** (previously 0.2.0-rc.2 with devDependencies pinned to 0.1.1-rc.2); every `@deepseek-ai/dsh-*` peer is now `>=0.2.2-rc.5 <0.3.0-0`, devDependencies are pinned to `0.2.2-rc.5` (`@deepseek-ai/cordis` 4.1.0, `@deepseek-ai/schemastery` 3.19.0), and `engines.node` is `>=24.9.0` (dsh 0.2.1-rc.2+ requires Node 24)
+- `src/fs-ssh.ts` implements the `FileSystem` members dsh 0.2.x added — `readByteRange`, `patchText` (official `applyHunks`, `FS_PATCH_MISMATCH`), `deleteFile` and `moveFile` (canonical lock order, `FS_SAME_TARGET`, two-phase `sourceDeleted`/`sourceFailure`) — with `watch` now an `override`
+- `src/subprocess-ssh.ts` implements `SubprocessRuntime.terminalEnvironment` (remote login shell probe) and the `SubprocessHandle.control` member (a spec requesting a control channel is rejected up front over SSH)
+- `src/job-runner.ts` follows the dsh-jobs 0.2.x contract: the remote log is a `JobOutputSource` the registry pumps (`read(fromByte)` → text/`nextOffset`/`lossy`) instead of the removed `JobHooks.readOutput`, and background jobs are owned by `exec.agent.id` (`SessionId`) rather than the agent object; the log fetch now uses an exact byte cursor (`tail -c +N | head -c 64KiB | base64`) with UTF-8 boundary-safe offsets, local trimming of delivered bytes and a final drain before settlement
+- `src/typert.ts` types the host typert contribution with the official `TypertContribution` (`@deepseek-ai/dsh-typert-registry` now declares `register` itself) and ships an empty reflection model instead of `undefined`
+- `client/index.js`: the native directory picker is read from the new `uiWorkspace` service (old `workspaces` face and `remote.directoryPicker` kept as fallbacks), and the dual-tab workspace picker also fills the third directory-flow hole `workspace.picker.directoryFlow` introduced by ui-workspace
+- `scripts/check-dsh-contract.mjs` (30 → 49 checks) mounts `@deepseek-ai/dsh-tool-executor-native` for the `meta.diffs` full-chain probe (ToolRuntime no longer executes by itself), probes the 0.2.2 surfaces above, and anchors the PathLabel check to the `data-path-label` DOM contract in the web frontend bundle
+- Imports use `@deepseek-ai/schemastery` (dsh no longer ships the bare `schemastery` package)
+
+### Removed
+- The `./invariant` companion plugin (source, export, tsdown entry and `@deepseek-ai/dsh-invariants` devDependency) — dsh 0.2.0-rc.2 removed the runtime-invariant registry and every `/invariant` subpath; `@deepseek-ai/dsh-code-runtime` devDependency (package no longer shipped)
+
+### Fixed
+- Background job output: the previous `dd` block-aligned fetch silently skipped the remainder of a not-yet-full 64 KiB block, and multibyte characters split across fetches rendered as replacement characters; both are gone, and the last ≤3 s of a finished command's output is no longer lost at settlement
+- `test-built-lib.mjs` locates the `HostStore` chunk by class name (the shared chunk is no longer named `engine-*`)
+
 ## [v0.3.0] — 2026-09-18
 
 ### Added

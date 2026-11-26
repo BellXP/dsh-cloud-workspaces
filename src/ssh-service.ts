@@ -17,7 +17,7 @@
 
 import { Service } from '@deepseek-ai/cordis'
 import type { Context } from '@deepseek-ai/cordis'
-import z from 'schemastery'
+import z from '@deepseek-ai/schemastery'
 import { SshEngine, quoteSh } from './engine'
 import type { SshExecChannel, ShellSession } from './engine'
 import type { ExecResult, LoginEnvRecord, RemoteDirEntry, RemoteFileContent, WorkspaceStatus } from './protocol'
