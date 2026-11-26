@@ -2,6 +2,11 @@
 
 All notable changes to `dsh-cloud-workspaces` are documented here.
 
+## [v0.10.1] — 2026-11-26
+
+### Added
+- **`~/.ssh/config` import now carries proxy settings.** `importSshConfig` translates a recognised HTTP-proxy `ProxyCommand` into the entry's native `httpProxy` (so no ncat is needed inside dsh): ncat `--proxy host:port --proxy-type http [--proxy-auth "user:pass"]` (quoted Windows paths and `--opt=value` forms included), OpenBSD `nc -X connect -x host:port`, and `connect -H host:port`. `ProxyJump` aliases that name an imported block become the entry's `proxyJump` chain; patterns, inline `user@host:port` hops and dangling aliases are dropped instead of failing at dial time. SOCKS helpers, `ssh -W` and unknown commands are left untouched (configure those by hand). Existing `-inter` style duplicate hosts therefore import as working proxy hosts. `importSshConfig(text?)` accepts config text for tests; `httpProxyFromProxyCommand` and `proxyJumpFromValue` are exported pure functions
+
 ## [v0.10.0] — 2026-11-26
 
 ### Changed

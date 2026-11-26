@@ -8,7 +8,7 @@ import { execFileSync } from 'node:child_process'
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
-import type { HostPayload, ImportResult, SshHostEntry, SshHostSummary } from './protocol'
+import type { HostPayload, HttpProxyConfig, ImportResult, SshHostEntry, SshHostSummary } from './protocol'
 
 /** Reject control characters that could split a CONNECT request line. */
 function isHeaderSafe(value: string): boolean {
@@ -54,6 +54,10 @@ export interface RawSshHostBlock {
   port?: number
   user?: string
   identityFile?: string
+  /** Raw `ProxyCommand` line (ncat/nc/connect HTTP-proxy forms are translated on import). */
+  proxyCommand?: string
+  /** Raw `ProxyJump` value (comma/whitespace-separated host aliases). */
+  proxyJump?: string
 }
 
 export function parseSshConfig(text: string): RawSshHostBlock[] {
@@ -102,6 +106,12 @@ export function parseSshConfig(text: string): RawSshHostBlock[] {
       case 'identityfile':
         if (current.identityFile === undefined) current.identityFile = value
         break
+      case 'proxycommand':
+        if (current.proxyCommand === undefined) current.proxyCommand = value
+        break
+      case 'proxyjump':
+        if (current.proxyJump === undefined) current.proxyJump = value
+        break
       default:
         break
     }
@@ -113,6 +123,93 @@ export function parseSshConfig(text: string): RawSshHostBlock[] {
   // (e.g. "Host a b") are dropped by the hostName check — acceptable.
   void pendingName
   return blocks
+}
+
+/** Split a ProxyCommand into tokens, honouring double/single quotes (Windows paths with spaces). */
+function tokenizeCommand(command: string): string[] {
+  const tokens: string[] = []
+  const re = /\s*(?:"([^"]*)"|'([^']*)'|([^\s"']+))/g
+  let match: RegExpExecArray | null
+  while ((match = re.exec(command)) !== null) {
+    tokens.push(match[1] ?? match[2] ?? match[3] ?? '')
+  }
+  return tokens
+}
+
+/** `host:port` → parts; a bare host gets the given default port. IPv6 needs brackets. */
+function splitHostPort(value: string, defaultPort: number): { host: string; port: number } | undefined {
+  const m = /^(.*?)(?::(\d{1,5}))?$/.exec(value.trim())
+  if (!m) return undefined
+  const host = m[1]!.replace(/^\[|\]$/g, '').trim()
+  if (host === '') return undefined
+  const port = m[2] !== undefined ? Number.parseInt(m[2], 10) : defaultPort
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return undefined
+  return { host, port }
+}
+
+/**
+ * Translate an OpenSSH `ProxyCommand` into the plugin's native HTTP CONNECT
+ * proxy when the command is a recognised HTTP-proxy helper; `undefined` for
+ * anything else (SOCKS, `ssh -W`, custom scripts — those keep their own path
+ * and must be configured by hand).
+ *
+ * Recognised forms:
+ *   ncat[.exe] --proxy host:port --proxy-type http [--proxy-auth "user:pass"] %h %p
+ *   nc -X connect -x host:port                          (OpenBSD netcat, HTTP CONNECT)
+ *   connect.exe -H host:port                            (connect.c, HTTP)
+ */
+export function httpProxyFromProxyCommand(command: string): HttpProxyConfig | undefined {
+  const tokens = tokenizeCommand(command)
+  if (tokens.length === 0) return undefined
+  const program = tokens[0]!.split(/[\\/]/).pop()!.toLowerCase()
+  const option = (name: string): string | undefined => {
+    const index = tokens.indexOf(name)
+    if (index >= 0 && index + 1 < tokens.length) return tokens[index + 1]
+    const prefix = `${name}=`
+    const inline = tokens.find((token) => token.startsWith(prefix))
+    return inline === undefined ? undefined : inline.slice(prefix.length)
+  }
+  const auth = (value: string | undefined): Pick<HttpProxyConfig, 'username' | 'password'> => {
+    if (value === undefined) return {}
+    const index = value.indexOf(':')
+    if (index < 0) return { username: value }
+    return { username: value.slice(0, index), password: value.slice(index + 1) }
+  }
+  if (program === 'ncat' || program === 'ncat.exe') {
+    const type = option('--proxy-type')
+    const target = option('--proxy')
+    if (type === undefined || type.toLowerCase() !== 'http' || target === undefined) return undefined
+    const endpoint = splitHostPort(target, 8080)
+    if (endpoint === undefined) return undefined
+    return { ...endpoint, ...auth(option('--proxy-auth')) }
+  }
+  if (program === 'nc' || program === 'nc.exe') {
+    const mode = option('-X')
+    const target = option('-x') ?? option('--proxy')
+    // `-x` alone defaults to SOCKS5 in OpenBSD netcat; only `connect` is HTTP.
+    if (mode === undefined || mode.toLowerCase() !== 'connect' || target === undefined) return undefined
+    const endpoint = splitHostPort(target, 3128)
+    if (endpoint === undefined) return undefined
+    return endpoint
+  }
+  if (program === 'connect' || program === 'connect.exe') {
+    const target = option('-H')
+    const endpoint = target === undefined ? undefined : splitHostPort(target, 8080)
+    return endpoint
+  }
+  return undefined
+}
+
+/**
+ * Translate a `ProxyJump` value into local aliases the plugin can chain
+ * through. Only aliases that name a parsed block are kept — the plugin's
+ * jump chain is by local alias, so a pattern (`*.corp`) or an inline
+ * `user@host:port` would dangle; the entry then imports without a jump
+ * chain instead of failing at dial time.
+ */
+export function proxyJumpFromValue(value: string | undefined, knownAliases: ReadonlySet<string>): string[] {
+  if (value === undefined || value.trim() === '' || value.toLowerCase() === 'none') return []
+  return value.split(/[,\s]+/).map((alias) => alias.trim()).filter((alias) => knownAliases.has(alias))
 }
 
 /** Read the ssh config file, returning its text or undefined when missing. */
@@ -299,13 +396,22 @@ export class HostStore {
     return removed
   }
 
-  /** Import hosts from ~/.ssh/config. Returns counts per outcome. */
-  importSshConfig(): ImportResult {
-    const text = readSshConfigFile()
-    if (text === undefined) {
+  /**
+   * Import hosts from ~/.ssh/config (or the given config text, for tests).
+   * `ProxyCommand` lines that are a recognised HTTP-proxy helper (ncat
+   * `--proxy-type http`, `nc -X connect`, `connect -H`) become the entry's
+   * native `httpProxy`; `ProxyJump` aliases that name an imported block
+   * become its jump chain. Returns counts per outcome.
+   */
+  importSshConfig(text?: string): ImportResult {
+    const source = text ?? readSshConfigFile()
+    if (source === undefined) {
       return { parsed: 0, added: 0, skipped: 0, skippedNames: [] }
     }
-    const blocks = parseSshConfig(text)
+    const blocks = parseSshConfig(source)
+    const knownAliases = new Set(
+      blocks.map((block) => block.name.trim()).filter((name) => name !== '' && !name.includes('*') && !name.includes('?')),
+    )
     let added = 0
     const skippedNames: string[] = []
     for (const block of blocks) {
@@ -329,6 +435,8 @@ export class HostStore {
           kind: 'key',
           keyPath: block.identityFile ?? '~/.ssh/id_ed25519',
         },
+        proxyJump: proxyJumpFromValue(block.proxyJump, knownAliases),
+        httpProxy: httpProxyFromProxyCommand(block.proxyCommand ?? ''),
         tags: ['ssh-config'],
       }, undefined)
       added += 1
