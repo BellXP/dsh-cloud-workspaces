@@ -109,6 +109,13 @@ describe('parseFindListing', () => {
     expect(entries[1]?.size).toBe(1704)
   })
 
+  it('truncates the fractional %T@ seconds to whole seconds, like the SFTP stats it stands in for', () => {
+    // The tools declare mtimeMs as an integer: a fractional mtime made every listing of such a host fail validation.
+    const entries = parseFindListing('d\t4096\t1795696790.999500000\t755\twork\t\0f\t1\t1795696790.278123456\t644\tf\t\0')
+    expect(entries.map((e) => e.mtime)).toEqual([1795696790, 1795696790])
+    expect(entries.map((e) => Number.isInteger(e.mtime))).toEqual([true, true])
+  })
+
   it('drops junk that does not have the record shape', () => {
     expect(parseFindListing('just text\nmore text\n')).toEqual([])
     expect(parseFindListing('')).toEqual([])

@@ -1333,7 +1333,7 @@ export class SshEngine {
           name: entry.name,
           type: view.isDirectory() ? 'dir' : view.isFile() ? 'file' : 'other',
           size: view.size,
-          mtimeMs: view.mtime * 1000,
+          mtimeMs: Math.round(view.mtime * 1000),
           mode: view.mode,
           ...(entry.isLink ? { symlink: true } : {}),
         }
@@ -1384,7 +1384,7 @@ export class SshEngine {
       content: slice.toString('utf8'),
       truncated,
       size: stat.size,
-      mtimeMs: stat.mtime * 1000,
+      mtimeMs: Math.round(stat.mtime * 1000),
     }
   }
 
@@ -1410,7 +1410,7 @@ export class SshEngine {
         else resolve(stats)
       })
     })
-    return { size: stat.size, mtimeMs: stat.mtime * 1000 }
+    return { size: stat.size, mtimeMs: Math.round(stat.mtime * 1000) }
   }
 
   /** Create the missing parent directories of a remote path (bottom-up scan). */

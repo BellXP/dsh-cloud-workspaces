@@ -156,7 +156,8 @@ export function parseFindListing(stdout: string): ShellListedEntry[] {
     const name = (lastTab === -1 ? rest : rest.slice(0, lastTab)).replace(/\r+$/, '')
     const target = lastTab === -1 ? '' : rest.slice(lastTab + 1).replace(/\r+$/, '')
     if (name === '' || name === '.' || name === '..') continue
-    entries.push({ name, kind, size: Number(size), mtime: Number(mtime), perms: parseInt(perms, 8), target })
+    // %T@ carries fractional seconds (1764244012.1234567890); the SFTP stats it stands in for are whole seconds.
+    entries.push({ name, kind, size: Number(size), mtime: Math.trunc(Number(mtime)), perms: parseInt(perms, 8), target })
   }
   return entries
 }

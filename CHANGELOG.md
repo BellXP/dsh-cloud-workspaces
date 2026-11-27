@@ -2,6 +2,11 @@
 
 All notable changes to `dsh-cloud-workspaces` are documented here.
 
+## [v0.10.9] — 2026-11-27
+
+### Fixed
+- **`ssh_ls` / directory listings failed validation on hosts that list through the shell fallback** (`mtimeMs must be an integer`, seen on `dmtp-debug` for `/home/ma-user`): `find -printf '%T@'` prints fractional seconds while the SFTP stats it stands in for are whole seconds. `parseFindListing` now truncates to whole seconds and the engine rounds every `mtimeMs` it reports.
+
 ## [v0.10.8] — 2026-11-27
 
 ### Fixed
