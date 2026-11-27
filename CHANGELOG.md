@@ -13,7 +13,7 @@ All notable changes to `dsh-cloud-workspaces` are documented here.
 ### Added
 - **`UtilityShell`**: one long-lived `bash --noprofile --norc` channel per connection for the engine's own small commands, NUL-free sentinel framing (`__DSH_REMOTE_IDE_EXIT__<code>__`), strictly serialised, closed on a timeout and reopened on the next call. On the Ascend image every `exec` channel costs a 15 s login shell (the rc file imports torch twice); the helper shell pays it once and then runs `find` in ~130 ms. Not yet used for `exec` itself.
 - `EngineOptions.sftpReaddirTimeoutMs`.
-- Tests (+22, 219 total): `sftp-resilience` (preamble gate incl. split packets and overflow, `find` output parsing with banners / CRLF / odd names, dangling and resolved links without extra `stat`, the resilient `readdir` in all five modes incl. ssh2's continuation calls) and `engine-resilience` (the switch landing on the connection record, later `ls` skipping SFTP, the helper shell's framing / serialisation / timeout-reopen / closed-shell reporting).
+- Tests (+21, 218 total): `sftp-resilience` (preamble gate incl. split packets and overflow, `find` output parsing with banners / CRLF / odd names, dangling and resolved links without extra `stat`, the resilient `readdir` in all five modes incl. ssh2's continuation calls) and `engine-resilience` (the switch landing on the connection record, later `ls` skipping SFTP, the helper shell's framing / serialisation / timeout-reopen / closed-shell reporting).
 
 ## [v0.10.7] — 2026-11-27
 
