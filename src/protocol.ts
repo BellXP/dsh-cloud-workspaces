@@ -137,13 +137,20 @@ export interface TestResult {
   error?: string
 }
 
-/** One directory listing entry (remote file browser). */
+/**
+ * One directory listing entry (remote file browser).
+ *
+ * `type` / `size` / `mtimeMs` / `mode` describe what the entry is once
+ * symlinks are followed; a symlinked entry additionally carries `symlink`.
+ */
 export interface RemoteDirEntry {
   name: string
   type: 'dir' | 'file' | 'other'
   size: number
   mtimeMs: number
   mode?: number
+  /** The entry itself is a symbolic link (possibly a dangling one: `type` is then `other`). */
+  symlink?: boolean
 }
 
 /** Remote file read result (editor open). */

@@ -24,7 +24,9 @@
  * - watch 对远端 target 走伪 watch（mtime/attrs 指纹轮询，content-free
  *   changed()）；连续失败达上限才 changed(error) 自停 → 官方 changes()
  *   映射为 workspace-file/watch-unsupported（侧边栏降级为手动刷新）；
- * - listDir 条目带 {name,type,target,size?}（version 会被 wire 层剥掉）。
+ * - listDir 条目带 {name,type,target,size?}（version 会被 wire 层剥掉）；
+ *   符号链接条目按指向的对象报 directory/file（悬空为 other），与官方本地
+ *   后端列目录时 stat 跟随链接的语义一致——指向目录的软链接因此可展开。
  */
 
 import path from 'node:path'
@@ -35,6 +37,7 @@ import type { FsDirEntry, FsInfo, FsPathInfo, FsTarget } from '@deepseek-ai/dsh-
 import type { SFTPWrapper, Stats as SftpStats } from 'ssh2'
 import type { SshRuntime } from './ssh-service'
 import { debugLog } from './debug-log'
+import { listFollowingSymlinks, type SftpListing } from './sftp-list'
 import { encodeRemotePath, mapLocalTreeToRemote, remoteRoot, resolveRemotePath } from './workspace'
 
 /** streamText 的读取上限：对齐 workspace-files 的整文件上限（32 MiB）留余量。 */
@@ -80,7 +83,7 @@ function versionOf(remotePath: string, stats: SftpStats): FsVersion {
 }
 
 /** SFTP mode 的三态/四态类型。 */
-function typeOf(stats: SftpStats, allowSymlink = false): FsInfo['type'] | 'symlink' {
+function typeOf(stats: { mode: number }, allowSymlink = false): FsInfo['type'] | 'symlink' {
   const kind = stats.mode & 0o170000
   if (kind === 0o040000) return 'directory'
   if (kind === 0o100000) return 'file'
@@ -275,16 +278,19 @@ export function installRemoteFsSeam(ctx: Context, runtime: SshRuntime, enabled: 
       signal?.throwIfAborted()
       try {
         const sftp = await sftpFor(route.hostId)
-        const listed = await sftpCall<Array<{ filename: string; attrs: SftpStats }>>(cb => sftp.readdir(route.remotePath, cb))
+        // 与官方本地后端一致：符号链接条目按它指向的对象报类型（stat 跟随），
+        // 指向目录的软链接因此可展开；悬空链接才是 other。
+        const listed = await listFollowingSymlinks(sftp as unknown as SftpListing, route.remotePath)
         debugLog(`fs seam listDir: ${route.hostId}:${route.remotePath} ok (${listed.length} entries)`)
         const entries: FsDirEntry[] = []
         for (const entry of listed) {
-          const childKey = path.join(route.key, entry.filename)
+          const view = entry.followed ?? entry.attrs
+          const childKey = path.join(route.key, entry.name)
           entries.push({
-            name: entry.filename,
-            type: typeOf(entry.attrs) as FsInfo['type'],
+            name: entry.name,
+            type: typeOf(view) as FsInfo['type'],
             target: { targetKey: FsTargetKey(childKey), displayPath: childKey },
-            ...(entry.attrs.isFile() ? { size: entry.attrs.size } : {}),
+            ...(view.isFile() ? { size: view.size } : {}),
           })
         }
         return entries.sort((left, right) => left.name.localeCompare(right.name))

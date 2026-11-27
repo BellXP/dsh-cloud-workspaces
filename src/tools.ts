@@ -56,11 +56,15 @@ function renderExec(result: { success: boolean; exitCode?: number | null; timedO
   return parts.join('\n')
 }
 
-/** Render one directory listing. */
+/** Render one directory listing (`l>d`: a symlink to a directory, `l>-`: to a file, `l>?`: dangling). */
 function renderEntries(entries: RemoteDirEntry[]): string {
   if (entries.length === 0) return '(empty directory)'
+  const kind = (e: RemoteDirEntry): string => {
+    const target = e.type === 'dir' ? 'd' : e.type === 'file' ? '-' : '?'
+    return e.symlink === true ? `l>${target}` : target
+  }
   const rows = entries.map(e => [
-    e.type === 'dir' ? 'd' : e.type === 'file' ? '-' : '?',
+    kind(e),
     String(e.size),
     e.name,
   ].join('\t'))
@@ -255,6 +259,9 @@ export function sshLsTool(runtime: SshRuntime) {
                 // Raw stat mode (engine.ls always sets it); optional in the
                 // shared entry type, so the schema keeps it optional too.
                 mode: { type: 'integer' },
+                // The entry is a symbolic link; type/size/mode already describe
+                // what it points at.
+                symlink: { type: 'boolean' },
               },
             },
           },

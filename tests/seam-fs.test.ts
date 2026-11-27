@@ -27,7 +27,8 @@ class LocalFs {
   async readBytes(..._args: unknown[]): Promise<never> { throw new Error('local:readBytes') }
 }
 
-interface FakeNode { kind: 'file' | 'dir'; mtime: number; content?: Buffer }
+/** `link` 节点：`target` 指向另一个节点的绝对路径（悬空链接的 target 不存在）。 */
+interface FakeNode { kind: 'file' | 'dir' | 'link'; mtime: number; content?: Buffer; target?: string }
 
 /** 计数 + 内存节点的假 SFTP。 */
 function makeSftpHarness() {
@@ -35,13 +36,29 @@ function makeSftpHarness() {
   const calls = { lstat: 0, stat: 0, readdir: 0 }
   const state = { breakLstat: false }
   const statsOf = (n: FakeNode) => ({
-    size: n.kind === 'file' ? (n.content?.length ?? 0) : 0,
-    mode: n.kind === 'file' ? 0o100644 : 0o040755,
+    size: n.kind === 'file' ? (n.content?.length ?? 0) : n.kind === 'link' ? 1 : 0,
+    mode: n.kind === 'file' ? 0o100644 : n.kind === 'link' ? 0o120777 : 0o040755,
     mtime: n.mtime,
     isFile: () => n.kind === 'file',
     isDirectory: () => n.kind === 'dir',
   })
   const missing = () => new Error('No such file')
+  /** 跟随路径上任意一段符号链接（最多 8 跳）；悬空或成环返回 undefined。 */
+  const follow = (p: string, hops = 0): string | undefined => {
+    if (hops > 8) return undefined
+    const parts = p.split('/').filter((part) => part !== '')
+    let current = ''
+    for (let index = 0; index < parts.length; index += 1) {
+      current = `/${parts.slice(0, index + 1).join('/')}`
+      const n = nodes.get(current)
+      if (n?.kind === 'link') {
+        if (n.target === undefined) return undefined
+        const rest = parts.slice(index + 1)
+        return follow(`${n.target}${rest.length > 0 ? '/' : ''}${rest.join('/')}`, hops + 1)
+      }
+    }
+    return p.startsWith('/') ? p : `/${p}`
+  }
   const sftp = {
     lstat(p: string, cb: (e: Error | undefined, s?: unknown) => void) {
       calls.lstat += 1
@@ -51,13 +68,16 @@ function makeSftpHarness() {
     },
     stat(p: string, cb: (e: Error | undefined, s?: unknown) => void) {
       calls.stat += 1
-      const n = nodes.get(p)
+      // stat 语义：跟随符号链接。
+      const real = follow(p)
+      const n = real === undefined ? undefined : nodes.get(real)
       n === undefined ? cb(missing()) : cb(undefined, statsOf(n))
     },
     readdir(p: string, cb: (e: Error | undefined, list?: Array<{ filename: string; attrs: unknown }>) => void) {
       calls.readdir += 1
-      if (!nodes.has(p)) { cb(missing()); return }
-      const prefix = p.endsWith('/') ? p : `${p}/`
+      const real = follow(p)
+      if (real === undefined || nodes.get(real)?.kind !== 'dir') { cb(missing()); return }
+      const prefix = real.endsWith('/') ? real : `${real}/`
       const out: Array<{ filename: string; attrs: unknown }> = []
       for (const [k, n] of nodes) {
         if (!k.startsWith(prefix)) continue
@@ -68,11 +88,13 @@ function makeSftpHarness() {
       cb(undefined, out)
     },
     readFile(p: string, cb: (e: Error | undefined, b?: Buffer) => void) {
-      const n = nodes.get(p)
+      const real = follow(p)
+      const n = real === undefined ? undefined : nodes.get(real)
       n?.content === undefined ? cb(missing()) : cb(undefined, n.content)
     },
     createReadStream(p: string) {
-      const n = nodes.get(p)
+      const real = follow(p)
+      const n = real === undefined ? undefined : nodes.get(real)
       return Readable.from([n?.content ?? Buffer.alloc(0)])
     },
   }
@@ -255,6 +277,77 @@ describe('seam-fs 伪 watch', () => {
     const surface = fs as unknown as { watch: (t: FsTarget, c: (e?: Error) => void, s: AbortSignal) => Promise<() => Promise<void>> }
     await expect(surface.watch(local, changed, new AbortController().signal))
       .rejects.toThrow('Filesystem watching is not supported')
+  })
+})
+
+// ------------------------------------------------- listDir 跟随符号链接
+
+describe('seam-fs listDir 跟随符号链接', () => {
+  /** `/xupeng/public -> /public` 这类共享目录：链接在文件树里必须是一个可展开的目录。 */
+  const seedLinks = (h: ReturnType<typeof makeSftpHarness>) => {
+    h.nodes.set(REMOTE_PROJ, { kind: 'dir', mtime: 1 })
+    h.nodes.set(`${REMOTE_PROJ}/src`, { kind: 'dir', mtime: 1 })
+    h.nodes.set(`${REMOTE_PROJ}/README.md`, { kind: 'file', mtime: 1, content: Buffer.from('hello world!') })
+    h.nodes.set(`${REMOTE_PROJ}/public`, { kind: 'link', mtime: 1, target: '/srv/public' })
+    h.nodes.set('/srv/public', { kind: 'dir', mtime: 2 })
+    h.nodes.set('/srv/public/shared.tex', { kind: 'file', mtime: 2, content: Buffer.from('x') })
+    h.nodes.set(`${REMOTE_PROJ}/latest.log`, { kind: 'link', mtime: 1, target: '/var/log/app.log' })
+    h.nodes.set('/var/log/app.log', { kind: 'file', mtime: 3, content: Buffer.from('0123456789') })
+    h.nodes.set(`${REMOTE_PROJ}/gone`, { kind: 'link', mtime: 1, target: '/deleted' })
+  }
+
+  it('指向目录/文件的软链接按指向的对象报类型，悬空链接才是 other', async () => {
+    const h = makeSftpHarness()
+    seedLinks(h)
+    const { fs } = install(h)
+
+    const entries = await fs.listDir(targetOf(REMOTE_PROJ))
+    const byName = new Map(entries.map((entry) => [entry.name, entry]))
+
+    expect(byName.get('src')?.type).toBe('directory')
+    expect(byName.get('public')?.type).toBe('directory')
+    expect(byName.get('latest.log')?.type).toBe('file')
+    expect(byName.get('latest.log')?.size).toBe(10)
+    expect(byName.get('gone')?.type).toBe('other')
+    expect(byName.get('README.md')?.size).toBe(12)
+    // 只有三个链接各花一次 stat；其余条目沿用 readdir 的属性。
+    expect(h.calls.stat).toBe(3)
+  })
+
+  it('软链接目录可以展开：子条目的 key 落在链接路径下，读的是它指向的目录', async () => {
+    const h = makeSftpHarness()
+    seedLinks(h)
+    const { fs } = install(h)
+
+    const top = await fs.listDir(targetOf(REMOTE_PROJ))
+    const publicEntry = top.find((entry) => entry.name === 'public')
+    expect(publicEntry).toBeDefined()
+    expect(publicEntry?.type).toBe('directory')
+
+    const children = await fs.listDir(publicEntry!.target)
+    expect(children.map((entry) => entry.name)).toEqual(['shared.tex'])
+    expect(children[0]?.target.displayPath).toBe(join(publicEntry!.target.displayPath, 'shared.tex'))
+    // 链接路径下的文件可读可写：路径在服务器一侧解析，key 仍是词法的链接形态。
+    const bytes = await fs.readBytes(children[0]!.target, undefined, 1024)
+    expect(Buffer.from(bytes).toString()).toBe('x')
+    expect((await fs.stat(children[0]!.target))?.type).toBe('file')
+  })
+
+  it('lstat 仍如实报告 symlink（信任边界规则依赖它），stat 跟随', async () => {
+    const h = makeSftpHarness()
+    seedLinks(h)
+    const { fs } = install(h)
+
+    expect((await fs.lstat(keyOf(`${REMOTE_PROJ}/public`)))?.type).toBe('symlink')
+    expect((await fs.stat(targetOf(`${REMOTE_PROJ}/public`)))?.type).toBe('directory')
+    await expect(fs.stat(targetOf(`${REMOTE_PROJ}/gone`))).resolves.toBeUndefined()
+  })
+
+  it('目录不存在仍是 FS_NOT_FOUND', async () => {
+    const h = makeSftpHarness()
+    const { fs } = install(h)
+
+    await expect(fs.listDir(targetOf('/home/dev/absent'))).rejects.toThrow(/not found/)
   })
 })
 

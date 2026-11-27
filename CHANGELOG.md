@@ -2,6 +2,14 @@
 
 All notable changes to `dsh-cloud-workspaces` are documented here.
 
+## [v0.10.7] — 2026-11-27
+
+### Fixed
+- **Symlinked directories were dead ends in the file tree and the workspace picker.** `readdir` reports a symbolic link with the link's own mode (`S_IFLNK`), which is neither a file nor a directory, so the fs seam's `listDir` typed such entries `other` and the sidebar tree showed them as leaves that never expand; `engine.ls` did the same, and the picker (which lists only `type: 'dir'` as sub-directories) could not enter them either. The official local fs backend `stat`s every listed child — following links — so on this machine a link to a folder *is* an expandable folder. Both listing paths now do the same (`src/sftp-list.ts`): only the symlink entries cost one extra `stat` each; a link reports what it points at (`dir` / `file`, with the target's size and mtime); a dangling link or a link loop stays `other` instead of failing the whole listing. `fs.lstat` still reports `symlink` for the entry itself, which the trust-boundary rules rely on. `ssh_ls` entries carry `symlink: true` for links and render as `l>d` / `l>-` / `l>?`.
+
+### Added
+- Tests (+11, 197 total): `sftp-list` (follow to dir / file, dangling, loop, ELOOP, failing `readdir`, chained links, no extra `stat` for plain entries), the fs seam's `listDir` over links (types, expanding a linked folder, reading through it, `lstat` unchanged, `FS_NOT_FOUND`), and the `ssh_ls` schema / render for `symlink`.
+
 ## [v0.10.6] — 2026-11-26
 
 ### Changed

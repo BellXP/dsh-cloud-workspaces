@@ -24,6 +24,7 @@ import type {
 } from './protocol'
 import { expandHome, type HostStore } from './store'
 import { LOGIN_ENV_CAPTURE_COMMAND, assembleLoginEnvScript, loginEnvRemotePath } from './login-env'
+import { listFollowingSymlinks, type SftpListing } from './sftp-list'
 
 /**
  * 快速 shell 命令（登录环境快照重放路径）：非登录、无 rc，环境完全由
@@ -1126,26 +1127,24 @@ export class SshEngine {
     return record.sftpReady
   }
 
-  /** List a remote directory. */
+  /**
+   * List a remote directory. A symlinked entry reports what it points at
+   * (`dir` / `file`) and carries `symlink: true`, so the directory browser can
+   * enter it while `ssh_ls` still tells the model that the entry is a link.
+   */
   async ls(alias: string, path: string): Promise<RemoteDirEntry[]> {
     const sftp = await this.getSftp(alias)
-    const entries = await new Promise<import('ssh2').FileEntry[]>((resolve, reject) => {
-      sftp.readdir(path, (error, list) => {
-        if (error) reject(error)
-        else resolve(list)
-      })
-    })
-    return entries
+    const listed = await listFollowingSymlinks(sftp as unknown as SftpListing, path)
+    return listed
       .map((entry): RemoteDirEntry => {
-        const mode = entry.attrs.mode
-        const isDir = (mode & 0o170000) === 0o040000
-        const isFile = (mode & 0o170000) === 0o100000
+        const view = entry.followed ?? entry.attrs
         return {
-          name: entry.filename,
-          type: isDir ? 'dir' : isFile ? 'file' : 'other',
-          size: entry.attrs.size,
-          mtimeMs: entry.attrs.mtime * 1000,
-          mode,
+          name: entry.name,
+          type: view.isDirectory() ? 'dir' : view.isFile() ? 'file' : 'other',
+          size: view.size,
+          mtimeMs: view.mtime * 1000,
+          mode: view.mode,
+          ...(entry.isLink ? { symlink: true } : {}),
         }
       })
       .sort((a, b) => {

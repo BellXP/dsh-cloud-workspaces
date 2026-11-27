@@ -174,6 +174,35 @@ describe('ssh_ls 输出边界', () => {
       }
     }
   })
+
+  it('符号链接条目带 symlink：schema 声明该字段，渲染标出 l>（类型仍是跟随后的）', async () => {
+    // engine.ls 跟随软链接报 type，同时用 symlink 说明条目本身是链接。
+    const entries = [
+      { name: 'public', type: 'dir', size: 4096, mtimeMs: 1788056122468, mode: 0o40755, symlink: true },
+      { name: 'latest.log', type: 'file', size: 12, mtimeMs: 1788056122468, mode: 0o100644, symlink: true },
+      { name: 'README.md', type: 'file', size: 12, mtimeMs: 1788056122468, mode: 0o100644 },
+      { name: 'gone', type: 'other', size: 1, mtimeMs: 1788056122468, mode: 0o120777, symlink: true },
+    ]
+    const tool = sshLsTool(stubRuntime({ ls: async () => entries }))
+    const output = await tool.execute({ path: '/x' })
+    assertLosslessJson(output)
+    const schema = tool.output.schema as unknown as {
+      properties: { entries: { items: { properties: Record<string, unknown> } } }
+    }
+    const declared = new Set(Object.keys(schema.properties.entries.items.properties))
+    expect(declared.has('symlink')).toBe(true)
+    for (const entry of output.entries) {
+      for (const key of Object.keys(entry)) {
+        expect(declared.has(key)).toBe(true)
+      }
+    }
+
+    const rendered = tool.output.render({ path: '/x' }, output)
+    expect(rendered[0]?.text).toContain('l>d\t4096\tpublic')
+    expect(rendered[0]?.text).toContain('l>-\t12\tlatest.log')
+    expect(rendered[0]?.text).toContain('l>?\t1\tgone')
+    expect(rendered[0]?.text).toContain('-\t12\tREADME.md')
+  })
 })
 
 describe('ssh_exec 输出边界', () => {
