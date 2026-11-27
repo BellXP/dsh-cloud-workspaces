@@ -16,7 +16,8 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import type { ContentBlock } from '@deepseek-ai/dsh-llm'
+import type { ContentBlock, ImageBlock } from '@deepseek-ai/dsh-llm'
+import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import type { JobRegistry } from '@deepseek-ai/dsh-jobs'
 import { structuredPatch } from 'diff'
 import type { ExecResult } from './protocol'
@@ -35,6 +36,31 @@ export interface SessionRoute {
   remoteCwd: string
   /** 本地占位目录（占位绝对路径重锚定的基准）。 */
   placeholderCwd: string
+}
+
+/**
+ * 遮蔽 read_image 依赖的宿主服务（与官方 tool-fs 同源）：`llm` 做路由门禁——
+ * 只有确切路由的模型声明了 image 输入才允许读图；`attachments` 把图片字节
+ * 持久化为 DSH 的 durable attachment（模型上下文里唯一合法的 image 块形态）。
+ * 两者都是 agent scope 惰性解析：缺失即拒绝读图，绝不退回内联 base64。
+ */
+export interface SessionToolServices {
+  llm?: {
+    resolveModelInfo(provider: string, model: string, signal?: AbortSignal): Promise<{ inputModalities?: readonly string[] }>
+  }
+  attachments?: {
+    imageLimits: { mediaTypes: readonly string[] }
+    saveImage(input: { data: Uint8Array; mediaType: string; name?: string }): Promise<ImageAttachmentRef>
+  }
+}
+
+/** 执行上下文里 read_image 门禁需要的最小形状（官方 tool-fs 同款解析顺序）。 */
+interface RouteCapableExec {
+  signal?: AbortSignal
+  agent?: {
+    session: { requestHeader(): { config?: { provider?: string; model?: string } } | undefined }
+    options: { provider?: string; model?: string }
+  }
 }
 
 function text(value: string): ContentBlock[] {
@@ -208,7 +234,12 @@ function matchGlob(regexp: RegExp, pattern: string, relative: string): boolean {
 }
 
 /** 构建一个远程会话的遮蔽工具集（bash/read/write/edit/glob/grep/read_image）。 */
-export function buildSessionTools(runtime: SshRuntime, route: SessionRoute, jobs?: JobRegistry | undefined) {
+export function buildSessionTools(
+  runtime: SshRuntime,
+  route: SessionRoute,
+  jobs?: JobRegistry | undefined,
+  services?: () => SessionToolServices | undefined,
+) {
   const engine = runtime.engine
   /** 会话级常驻 shell（B 方案）：首条前台 bash 时惰性打开，cd/环境跨命令持久。 */
   let shell: PersistentShellSession | undefined
@@ -556,9 +587,41 @@ export function buildSessionTools(runtime: SshRuntime, route: SessionRoute, jobs
     { mediaType: 'image/webp', test: b => b.length > 12 && b.toString('ascii', 0, 4) === 'RIFF' && b.toString('ascii', 8, 12) === 'WEBP' },
   ]
 
+  /**
+   * 官方 tool-fs 同款门禁：解析会话当前路由（request header 配置，其次 agent
+   * options），要求确切路由的模型显式声明 image 输入。纯文本模型（如 glm-5.4）
+   * 读图会在 DSH 核心的 text-only 投影处抛 TypeError 直接崩掉本轮——与其让
+   * 块进历史，不如在工具处拒绝并提示换模型。
+   */
+  const assertImageCapableRoute = async (exec: RouteCapableExec | undefined, requestedPath: string, services: SessionToolServices | undefined): Promise<void> => {
+    const routed = exec?.agent?.session.requestHeader()?.config
+    const provider = routed?.provider ?? exec?.agent?.options.provider
+    const model = routed?.model ?? exec?.agent?.options.model
+    const llm = services?.llm
+    if (provider === undefined || model === undefined || llm === undefined) {
+      throw new Error(`cannot read "${requestedPath}" as an image: the current model route could not be resolved`)
+    }
+    const active = await llm.resolveModelInfo(provider, model, exec?.signal)
+    if (active.inputModalities === undefined || !active.inputModalities.includes('image')) {
+      throw new Error(`cannot read "${requestedPath}" as an image: model "${model}" does not declare image input; switch to an image-capable model to read images`)
+    }
+  }
+
+  /** 官方 read_image 的信封文本（路径 + 类型 + 尺寸，缩放时给出坐标换算系数）。 */
+  const formatImageReadOutput = (displayPath: string, image: ImageAttachmentRef): string => {
+    let scaled = ''
+    if (image.originalDimensions !== undefined) {
+      const x = (image.originalDimensions.width / image.width).toFixed(2)
+      const y = (image.originalDimensions.height / image.height).toFixed(2)
+      const advice = x === y ? `multiply coordinates by ${x}` : `multiply x coordinates by ${x} and y coordinates by ${y}`
+      scaled = ` (downscaled from ${image.originalDimensions.width}x${image.originalDimensions.height} px; ${advice} to locate features in the original file)`
+    }
+    return `<path>${displayPath}</path>\n<type>image</type>\n<content>\n${image.mediaType} image, ${image.width}x${image.height} px, ${image.bytes} bytes${scaled}\n</content>`
+  }
+
   const readImageTool = defineTool({
     name: 'read_image',
-    description: 'Read a PNG/JPEG/WebP/GIF file on the remote server and return the image itself.',
+    description: 'Read a PNG/JPEG/WebP/GIF file on the remote server and return the image itself. Large images are downscaled automatically.',
     parameters: {
       file_path: { type: 'string', description: 'Path to the image file (relative paths resolve against the remote workspace).', required: true },
     },
@@ -568,21 +631,48 @@ export function buildSessionTools(runtime: SshRuntime, route: SessionRoute, jobs
         additionalProperties: false,
         properties: {
           path: { type: 'string', required: true },
-          mediaType: { type: 'string', required: true },
-          bytes: { type: 'integer', required: true },
-          data: { type: 'string', required: true },
+          image: {
+            type: 'object',
+            required: true,
+            additionalProperties: false,
+            properties: {
+              attachmentId: { type: 'string', required: true },
+              mediaType: { type: 'string', required: true },
+              bytes: { type: 'integer', required: true },
+              width: { type: 'integer', required: true },
+              height: { type: 'integer', required: true },
+              name: { type: 'string' },
+              originalDimensions: {
+                type: 'object',
+                additionalProperties: false,
+                properties: { width: { type: 'integer', required: true }, height: { type: 'integer', required: true } },
+              },
+            },
+          },
         },
       },
+      /**
+       * 模型上下文里唯一合法的 image 块形态是 `{type:'image', attachment}`：核心
+       * 的 text-only 投影、pi-ai 适配器、compaction 都读 `block.attachment.*`。
+       * 旧版直接强转 `{type:'image', source:{base64}}` 让 glm-5.4 的会话每轮都
+       * 抛 "Cannot read properties of undefined (reading 'attachmentId')"。
+       */
       render: (_args, value) => {
         const blocks: ContentBlock[] = [
-          { type: 'text', text: `${String(value.path)} (${String(value.mediaType)}, ${String(value.bytes)} bytes)` },
-          { type: 'image', source: { type: 'base64', media_type: String(value.mediaType), data: String(value.data) } } as unknown as ContentBlock,
+          { type: 'text', text: formatImageReadOutput(String(value.path), value.image as ImageAttachmentRef) },
+          { type: 'image', attachment: value.image as ImageAttachmentRef } satisfies ImageBlock as ContentBlock,
         ]
         return blocks
       },
     },
-    async execute(args: { file_path: string }) {
+    async execute(args: { file_path: string }, exec) {
       const path = resolveInSession(route, args.file_path)
+      const host = services?.()
+      const attachments = host?.attachments
+      if (attachments === undefined) {
+        throw new Error(`cannot read "${args.file_path}" as an image: no attachment service is mounted`)
+      }
+      await assertImageCapableRoute(exec as unknown as RouteCapableExec, args.file_path, host)
       const sftp = await engine.getSftp(route.hostId)
       const buffer = await new Promise<Buffer>((resolve, reject) => {
         sftp.readFile(path, (error, data) => { if (error) reject(error); else resolve(data as Buffer) })
@@ -594,7 +684,12 @@ export function buildSessionTools(runtime: SshRuntime, route: SessionRoute, jobs
       if (mediaType === undefined) {
         throw new Error(`cannot read "${path}": read_image only accepts PNG/JPEG/WebP/GIF files`)
       }
-      return jsonSafe({ path, mediaType, bytes: buffer.length, data: buffer.toString('base64') })
+      if (!attachments.imageLimits.mediaTypes.includes(mediaType)) {
+        throw new Error(`cannot read "${path}": ${mediaType} images are not accepted by this deployment`)
+      }
+      // 字节经 attachment store 归一化并持久化；这里只拿回 durable 引用。
+      const image = await attachments.saveImage({ data: buffer, mediaType, name: path.split('/').pop() })
+      return jsonSafe({ path, image })
     },
   })
 
@@ -711,7 +806,15 @@ export function installSessionRouting(
             placeholderCwd: cwd ?? '',
           }
           // 先快照组合里已可见的同名工具，再注册遮蔽——注册之后再查会查到自己。
-          const tools = buildSessionTools(runtime, sessionRoute, jobsProvider?.())
+          // read_image 的门禁/持久化服务从 agent scope 惰性取（与官方 tool-fs 同源）。
+          const lookup = (name: string): unknown => {
+            const get = (scope as unknown as { get?: (key: string) => unknown }).get
+            return typeof get === 'function' ? get.call(scope, name) : undefined
+          }
+          const tools = buildSessionTools(runtime, sessionRoute, jobsProvider?.(), () => ({
+            llm: lookup('llm') as SessionToolServices['llm'],
+            attachments: lookup('attachments') as SessionToolServices['attachments'],
+          }))
           const selected = selectShadowTools(tools, snapshotVisibility(scope, tools.map((tool) => tool.name)))
           let registered = 0
           for (const tool of selected) {

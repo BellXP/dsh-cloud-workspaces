@@ -2,6 +2,14 @@
 
 All notable changes to `dsh-cloud-workspaces` are documented here.
 
+## [v0.10.10] — 2026-11-27
+
+### Fixed
+- **`read_image` in remote-workspace sessions crashed every later model request with `Cannot read properties of undefined (reading 'attachmentId')`.** The shadow tool had two faults. It skipped the image-capability gate the official `tool-fs` tool enforces, so a text-only route (for example GLM-5.4 with image input disabled in Settings → Models) could still read a picture; and it rendered the picture as an Anthropic-style inline block (`{type:'image', source:{type:'base64', …}}`, cast through `unknown`) instead of the durable `{type:'image', attachment}` reference that is the only image shape in model context. DSH's text-only projection, the pi-ai adapter and compaction all read `block.attachment.*`, so once that block was in the history the session failed on every turn regardless of which model was selected afterwards. The tool now mirrors the official one: it resolves the session's current route through `llm.resolveModelInfo` and refuses unless that exact model declares `image` input (naming the model and advising an image-capable one), requires a mounted attachment store, and persists the bytes through `attachments.saveImage` so the model receives a real attachment reference (downscaled by the store when needed, with the official `<path>`/`<type>`/`<content>` envelope). Both services are resolved lazily from the agent scope, exactly as the official tool resolves them, so the per-model "image" checkbox in Settings stays the single switch: off means the remote tool refuses, on means it reads. The 8 MiB cap and the PNG/JPEG/WebP/GIF sniffing are unchanged; a media type the deployment does not accept is refused as well. Session logs already carrying an inline block from the old tool are not repaired by this release; they need the block replaced or the tail truncated.
+
+### Added
+- Tests (+2, 221 total): `read_image` persists through the attachment store and renders a durable `attachment` block; a text-only route is refused before any SFTP read; a missing attachment store, an unresolvable route and a non-image file are each refused without ever falling back to inline bytes.
+
 ## [v0.10.9] — 2026-11-27
 
 ### Fixed

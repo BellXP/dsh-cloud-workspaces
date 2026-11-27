@@ -228,21 +228,68 @@ describe('buildSessionTools', () => {
     expect(run.mock.calls[0]?.[1]).toEqual({ timeoutMs: 30_000 })
   })
 
-  it('read_image：PNG 魔数识别 + base64 输出；非图片拒绝', async () => {
+  it('read_image：模型声明 image 输入时经 attachment store 持久化，输出 durable 引用而非内联 base64', async () => {
     const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3])
     const sftp = { readFile: (p: string, cb: (e: Error | null, d?: Buffer) => void) => cb(null, png) }
-    const tools = buildSessionTools(stubRuntime({ getSftp: async () => sftp }), route())
+    const saveImage = vi.fn(async (input: { data: Uint8Array; mediaType: string; name?: string }) => ({
+      attachmentId: `sha256:${Buffer.from(input.data).toString('hex')}`, mediaType: input.mediaType, bytes: input.data.byteLength, width: 4, height: 2, name: input.name,
+    }))
+    const resolveModelInfo = vi.fn(async () => ({ inputModalities: ['text', 'image'] }))
+    const tools = buildSessionTools(stubRuntime({ getSftp: async () => sftp }), route(), undefined, () => ({
+      llm: { resolveModelInfo }, attachments: { imageLimits: { mediaTypes: ['image/png'] }, saveImage },
+    }))
     const readImage = tools.find((t) => t.name === 'read_image')!
-    const output = await readImage.execute({ file_path: 'img/logo.png' })
-    expect(output.mediaType).toBe('image/png')
+    const exec = { agent: { session: { requestHeader: () => ({ config: { provider: 'p', model: 'm' } }) }, options: {} } }
+    const output = await readImage.execute({ file_path: 'img/logo.png' }, exec as never) as { path: string; image: Record<string, unknown> }
     expect(output.path).toBe(REMOTE_CWD + '/img/logo.png')
-    expect(output.data).toBe(png.toString('base64'))
-    expect(output.bytes).toBe(png.length)
+    expect(saveImage).toHaveBeenCalledTimes(1)
+    expect(Buffer.from(saveImage.mock.calls[0]![0].data)).toEqual(png)
+    expect(saveImage.mock.calls[0]![0]).toMatchObject({ mediaType: 'image/png', name: 'logo.png' })
+    expect(output.image).toMatchObject({ mediaType: 'image/png', bytes: png.length, width: 4, height: 2 })
+    expect(Object.hasOwn(output, 'data')).toBe(false)
+    expect(resolveModelInfo).toHaveBeenCalledWith('p', 'm', undefined)
+
+    // 渲染给模型的是 DSH 标准 image 块（带 attachment），核心投影/适配器都能读。
+    const rendered = (readImage as { output: { render: (a: unknown, v: unknown) => Array<Record<string, unknown>> } }).output.render({}, output)
+    expect(rendered.map((b) => b.type)).toEqual(['text', 'image'])
+    expect(rendered[1]).toHaveProperty('attachment.attachmentId')
+    expect(rendered[1]).not.toHaveProperty('source')
+    expect(String(rendered[0]!.text)).toContain('<path>' + REMOTE_CWD + '/img/logo.png</path>')
+  })
+
+  it('read_image：纯文本模型（inputModalities 无 image）在工具处拒绝，不读文件', async () => {
+    const readFile = vi.fn((_p: string, cb: (e: Error | null, d?: Buffer) => void) => cb(null, Buffer.from([0x89, 0x50, 0x4e, 0x47])))
+    const saveImage = vi.fn()
+    const tools = buildSessionTools(stubRuntime({ getSftp: async () => ({ readFile }) }), route(), undefined, () => ({
+      llm: { resolveModelInfo: async () => ({ inputModalities: ['text'] }) },
+      attachments: { imageLimits: { mediaTypes: ['image/png'] }, saveImage },
+    }))
+    const readImage = tools.find((t) => t.name === 'read_image')!
+    const exec = { agent: { session: { requestHeader: () => undefined }, options: { provider: 'zai-coding-cn', model: 'glm-5.4' } } }
+    await expect(readImage.execute({ file_path: 'fig.png' }, exec as never)).rejects.toThrow(/model "glm-5.4" does not declare image input; switch to an image-capable model/)
+    expect(readFile).not.toHaveBeenCalled()
+    expect(saveImage).not.toHaveBeenCalled()
+  })
+
+  it('read_image：无 attachment 服务 / 路由不可解析 / 非图片 一律拒绝，绝不退回内联 base64', async () => {
+    const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3])
+    const sftp = { readFile: (_p: string, cb: (e: Error | null, d?: Buffer) => void) => cb(null, png) }
+    const noStore = buildSessionTools(stubRuntime({ getSftp: async () => sftp }), route())
+    await expect(noStore.find((t) => t.name === 'read_image')!.execute({ file_path: 'a.png' })).rejects.toThrow(/no attachment service is mounted/)
+
+    const noRoute = buildSessionTools(stubRuntime({ getSftp: async () => sftp }), route(), undefined, () => ({
+      llm: { resolveModelInfo: async () => ({ inputModalities: ['text', 'image'] }) },
+      attachments: { imageLimits: { mediaTypes: ['image/png'] }, saveImage: vi.fn() },
+    }))
+    await expect(noRoute.find((t) => t.name === 'read_image')!.execute({ file_path: 'a.png' })).rejects.toThrow(/model route could not be resolved/)
 
     const badSftp = { readFile: (p: string, cb: (e: Error | null, d?: Buffer) => void) => cb(null, Buffer.from('plain text')) }
-    const tools2 = buildSessionTools(stubRuntime({ getSftp: async () => badSftp }), route())
-    const readImage2 = tools2.find((t) => t.name === 'read_image')!
-    await expect(readImage2.execute({ file_path: 'notes.txt' })).rejects.toThrow(/PNG\/JPEG\/WebP\/GIF/)
+    const tools2 = buildSessionTools(stubRuntime({ getSftp: async () => badSftp }), route(), undefined, () => ({
+      llm: { resolveModelInfo: async () => ({ inputModalities: ['text', 'image'] }) },
+      attachments: { imageLimits: { mediaTypes: ['image/png'] }, saveImage: vi.fn() },
+    }))
+    const exec = { agent: { session: { requestHeader: () => ({ config: { provider: 'p', model: 'm' } }) }, options: {} } }
+    await expect(tools2.find((t) => t.name === 'read_image')!.execute({ file_path: 'notes.txt' }, exec as never)).rejects.toThrow(/PNG\/JPEG\/WebP\/GIF/)
   })
 
   it('bash presenter：terminal 视图（官方 BashRow 可展开的前提）', () => {
