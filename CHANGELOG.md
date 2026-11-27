@@ -2,6 +2,11 @@
 
 All notable changes to `dsh-cloud-workspaces` are documented here.
 
+## [v0.10.12] — 2026-11-27
+
+### Added
+- `SshConnection.forwardOut(host, port)`: a `direct-tcpip` channel through the connection, so another plugin can reach a TCP target from the host's network position (no local port, no extra process). Optional on the interface like `execFast`; refused by servers with `AllowTcpForwarding no`, reported with the host name and the server's reason. First consumer: dsh-overleaf-sync routes the Overleaf realtime socket through the link's host.
+
 ## [v0.10.11] — 2026-11-27
 
 ### Fixed

@@ -113,6 +113,11 @@ export interface SshConnection {
   rename(from: string, to: string): Promise<void>
   /** 获取底层 SFTP 子系统句柄（fs-ssh 能力适配器直接消费，对应 e2b 的 sandbox.files）。 */
   getSftp(): Promise<import('ssh2').SFTPWrapper>
+  /**
+   * 经该主机打开一条直接 TCP 通道（`direct-tcpip`）：数据从远端的网络位置出去。
+   * 真实连接始终提供；测试桩可省略。
+   */
+  forwardOut?(host: string, port: number): Promise<import('node:stream').Duplex>
 }
 
 /**
@@ -431,6 +436,7 @@ export class SshRuntime extends Service {
       remove: (path) => engine.remove(alias, path),
       rename: (from, to) => engine.rename(alias, from, to),
       getSftp: () => engine.getSftp(alias),
+      forwardOut: (host, port) => engine.forwardOut(alias, host, port),
     }
   }
 }

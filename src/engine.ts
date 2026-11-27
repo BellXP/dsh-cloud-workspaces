@@ -1298,6 +1298,24 @@ export class SshEngine {
 
   // ------------------------------------------------------------------ sftp
 
+  /**
+   * Open a direct TCP channel through the connection (`direct-tcpip`): bytes flow from the remote
+   * host's network position, so the caller reaches targets only that host can reach - or reaches
+   * them without the local machine's proxy. Rejected by servers with `AllowTcpForwarding no`.
+   */
+  async forwardOut(alias: string, host: string, port: number): Promise<import('node:stream').Duplex> {
+    const record = await this.ensureConnection(alias)
+    return new Promise((resolve, reject) => {
+      record.client.forwardOut('127.0.0.1', 0, host, port, (error, stream) => {
+        if (error) {
+          reject(new Error(`port forwarding to ${host}:${port} was refused by ${alias}: ${error.message}`))
+          return
+        }
+        resolve(stream)
+      })
+    })
+  }
+
   /** Get (and lazily open) the SFTP subsystem of a connection. */
   async getSftp(alias: string): Promise<import('ssh2').SFTPWrapper> {
     const record = await this.ensureConnection(alias)
