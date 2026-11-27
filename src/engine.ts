@@ -24,7 +24,23 @@ import type {
 } from './protocol'
 import { expandHome, type HostStore } from './store'
 import { LOGIN_ENV_CAPTURE_COMMAND, assembleLoginEnvScript, loginEnvRemotePath } from './login-env'
-import { listFollowingSymlinks, type SftpListing } from './sftp-list'
+import {
+  findListingCommand,
+  installResilientReaddir,
+  listFollowingSymlinks,
+  parseFindListing,
+  shellEntriesToListing,
+  type ListedEntry,
+  type ShellListedEntry,
+  type SftpListing,
+} from './sftp-list'
+import { installSftpPreambleSkip } from './sftp-preamble'
+import { debugLog } from './debug-log'
+
+// sshd 经登录 shell 启动 SFTP 子系统：shell 往 stdout 打印的横幅会排在 VERSION 包前面，
+// 不丢掉它 ssh2 就把文字当包长度读（"Packet length ... exceeds max length"）。见 sftp-preamble.ts。
+const sftpPreambleSkipInstalled = installSftpPreambleSkip()
+debugLog(`ssh engine: sftp preamble skip ${sftpPreambleSkipInstalled ? 'installed' : 'NOT installed (ssh2 layout not recognised)'}`)
 
 /**
  * 快速 shell 命令（登录环境快照重放路径）：非登录、无 rc，环境完全由
@@ -46,6 +62,11 @@ export interface EngineOptions {
   defaultExecTimeoutMs?: number
   /** Cap on remote file bytes read into the editor (larger files are truncated). */
   maxReadBytes?: number
+  /**
+   * SFTP READDIR 没有应答多久就判这条会话已死、改走 shell 列目录（毫秒）。
+   * 服务端进程死掉时 ssh2 不会回调；真错误（不存在、无权限）会立刻回调，不受这个值影响。
+   */
+  sftpReaddirTimeoutMs?: number
 }
 
 const DEFAULTS: Required<EngineOptions> = {
@@ -55,6 +76,7 @@ const DEFAULTS: Required<EngineOptions> = {
   maxOutputBytes: 2 * 1024 * 1024,
   defaultExecTimeoutMs: 60_000,
   maxReadBytes: 2 * 1024 * 1024,
+  sftpReaddirTimeoutMs: 8_000,
 }
 
 /** One pooled connection record. */
@@ -65,12 +87,114 @@ interface PoolRecord {
   /** SFTP subsystem handle, lazily opened. */
   sftp?: import('ssh2').SFTPWrapper
   sftpReady?: Promise<import('ssh2').SFTPWrapper>
+  /** This host's SFTP READDIR failed once (server died / never answered): list through the shell. */
+  listingViaShell?: boolean
+  /** One long-lived helper shell per connection (see `UtilityShell`), opened on first use. */
+  utilityShell?: Promise<UtilityShell>
   /** Remote $HOME, resolved lazily. */
   home?: string
   idleAt: number
   broken: boolean
   /** Operations currently running on this connection (sweep guard). */
   inFlight: number
+}
+
+/**
+ * 每条连接一条常驻的辅助 shell，给引擎自己的小命令用（列目录兜底等）。
+ *
+ * 为什么不复用 exec：sshd 每开一个 exec 通道就经登录 shell 起一个新进程，而 bash 只要看到
+ * 环境里有 `SSH_CLIENT` 就读 `~/.bashrc`——不看 stdin 是不是套接字，pty 也躲不开。有的镜像
+ * 那个文件要跑 15 秒（Ascend 镜像 import 两次 torch）。常驻 shell 只在启动时付这一次，
+ * 之后每条命令都是毫秒级。命令用 `FAST_SHELL_COMMAND` 起（无 rc、无 profile），前缀干净。
+ *
+ * 协议：命令后跟一句 printf 打出 `\\n<sentinel><exit>__\\n`，读到带尾换行的完整哨兵才算一条结束；
+ * 一次只跑一条（排队），超时的命令结果丢弃，晚到的输出不会串进下一条（哨兵之前的内容被丢弃）。
+ */
+export interface UtilityShell {
+  run(command: string, timeoutMs: number): Promise<ExecResult>
+  close(): void
+}
+
+const UTILITY_SENTINEL = '__DSH_REMOTE_IDE_EXIT__'
+const UTILITY_DONE = new RegExp(`\\n${UTILITY_SENTINEL}(\\d+|\\?)__\\n`)
+
+function openUtilityShell(client: Client, onClosed: () => void): Promise<UtilityShell> {
+  return new Promise<UtilityShell>((resolve, reject) => {
+    client.exec(FAST_SHELL_COMMAND, (error, stream) => {
+      if (error) {
+        reject(error)
+        return
+      }
+      interface Job { command: string; timeoutMs: number; started: number; buffer: string; resolve: (result: ExecResult) => void; timer: NodeJS.Timeout }
+      let current: Job | undefined
+      const queue: Job[] = []
+      let closed = false
+      let closing = false
+      const fail = (job: Job, timedOut: boolean, why: string): ExecResult => ({
+        success: false,
+        exitCode: null,
+        timedOut,
+        stdout: job.buffer,
+        stderr: '',
+        durationMs: Date.now() - job.started,
+        error: why,
+      })
+      /** 通道没了，或一条命令超时（无法再对流重新对齐）：关掉 shell，排队中的全部失败；下次调用重开。 */
+      const failAll = (why: string, timedOutJob?: Job): void => {
+        if (closing) return
+        closing = true
+        closed = true
+        if (current !== undefined) {
+          clearTimeout(current.timer)
+          const job = current
+          current = undefined
+          job.resolve(fail(job, job === timedOutJob, why))
+        }
+        for (const job of queue.splice(0)) job.resolve({ ...fail(job, false, why), stdout: '' })
+        try {
+          stream.close()
+        } catch {
+          // already gone
+        }
+        onClosed()
+      }
+      const pump = (): void => {
+        if (current !== undefined) return
+        const job = queue.shift()
+        if (job === undefined) return
+        current = job
+        job.timer = setTimeout(() => failAll('utility shell command timed out; the shell was closed and reopens on the next call', job), job.timeoutMs)
+        stream.write(`${job.command}; printf '\\n${UTILITY_SENTINEL}%s__\\n' "$?"\n`)
+      }
+      stream.on('data', (chunk: Buffer) => {
+        if (current === undefined) return
+        current.buffer += chunk.toString('utf8')
+        const match = UTILITY_DONE.exec(current.buffer)
+        if (match === null) return
+        const job = current
+        current = undefined
+        clearTimeout(job.timer)
+        const code = match[1] === '?' ? null : Number(match[1])
+        job.resolve({ success: code === 0, exitCode: code, timedOut: false, stdout: job.buffer.slice(0, match.index), stderr: '', durationMs: Date.now() - job.started })
+        pump()
+      })
+      stream.stderr.on('data', () => {})
+      stream.on('close', () => failAll('utility shell closed'))
+      stream.on('error', () => failAll('utility shell channel error'))
+      resolve({
+        run: (command, timeoutMs) =>
+          new Promise<ExecResult>((res) => {
+            if (closed) {
+              res({ success: false, exitCode: null, timedOut: false, stdout: '', stderr: '', durationMs: 0, error: 'utility shell closed' })
+              return
+            }
+            queue.push({ command, timeoutMs, started: Date.now(), buffer: '', resolve: res, timer: undefined as unknown as NodeJS.Timeout })
+            pump()
+          }),
+        close: () => failAll('utility shell closed by the engine'),
+      })
+    })
+  })
 }
 
 /**
@@ -723,6 +847,8 @@ export class SshEngine {
       })
       client.on('close', () => {
         record.broken = true
+        record.utilityShell?.then((shell) => shell.close()).catch(() => {})
+        record.utilityShell = undefined
         if (this.activeAlias === alias) {
           this.state = 'disconnected'
           this.activeAlias = ''
@@ -1121,10 +1247,66 @@ export class SshEngine {
           return
         }
         record.sftp = sftp
+        this.hardenSftp(alias, record, sftp)
         resolve(sftp)
       })
     })
     return record.sftpReady
+  }
+
+  /**
+   * 给这条 SFTP 会话的 readdir 装上兜底（见 sftp-list.ts「readdir 兜底」）：有的镜像上
+   * READDIR 会让服务端进程死掉——华为云 ModelArts 的 Ascend 镜像列 home 目录必死——
+   * 节点不该为客户端改自己，于是判死后改走 shell 列目录，之后这台主机都走 shell。
+   */
+  private hardenSftp(alias: string, record: PoolRecord, sftp: import('ssh2').SFTPWrapper): void {
+    installResilientReaddir(sftp as unknown as SftpListing, {
+      timeoutMs: this.opts.sftpReaddirTimeoutMs,
+      useShell: () => record.listingViaShell === true,
+      onShellMode: () => {
+        record.listingViaShell = true
+        debugLog(`ssh engine: ${alias} lists directories through the shell from now on`)
+      },
+      onSessionBroken: () => this.dropSftp(record, sftp),
+      listViaShell: (path) => this.listViaShell(alias, path),
+    })
+  }
+
+  /**
+   * Run one helper command on the connection's long-lived shell (`UtilityShell`). The shell is
+   * opened on first use and reopened after it closes; a command that times out closes it.
+   */
+  private async runUtility(alias: string, command: string, timeoutMs: number): Promise<ExecResult> {
+    const record = await this.ensureConnection(alias)
+    record.idleAt = Date.now()
+    record.utilityShell ??= openUtilityShell(record.client, () => {
+      record.utilityShell = undefined
+    }).catch((error: unknown) => {
+      record.utilityShell = undefined
+      throw error
+    })
+    const shell = await record.utilityShell
+    return await shell.run(command, timeoutMs)
+  }
+
+  /** List one directory through the helper shell (see sftp-list.ts「readdir 兜底」). */
+  private async listViaShell(alias: string, path: string): Promise<ShellListedEntry[]> {
+    const result = await this.runUtility(alias, findListingCommand(path), 45_000)
+    if (!result.success) {
+      throw new Error(result.error ?? (result.stderr.trim() || `find exited with ${result.exitCode ?? 'no status'}`))
+    }
+    return parseFindListing(result.stdout)
+  }
+
+  /** Forget an SFTP session (its server is gone or going); the next `getSftp` opens a fresh one. */
+  private dropSftp(record: PoolRecord, sftp: import('ssh2').SFTPWrapper): void {
+    if (record.sftp === sftp) record.sftp = undefined
+    if (record.sftpReady !== undefined) record.sftpReady = undefined
+    try {
+      sftp.end()
+    } catch {
+      // already gone
+    }
   }
 
   /**
@@ -1133,8 +1315,17 @@ export class SshEngine {
    * enter it while `ssh_ls` still tells the model that the entry is a link.
    */
   async ls(alias: string, path: string): Promise<RemoteDirEntry[]> {
-    const sftp = await this.getSftp(alias)
-    const listed = await listFollowingSymlinks(sftp as unknown as SftpListing, path)
+    const record = await this.ensureConnection(alias)
+    // A host whose SFTP READDIR died once is listed through the helper shell from the start:
+    // opening an SFTP session on such a node costs a login shell (15 s on an Ascend image).
+    const listed: ListedEntry[] = record.listingViaShell === true
+      ? shellEntriesToListing(await this.listViaShell(alias, path)).map((entry) => ({
+          name: entry.filename,
+          attrs: entry.attrs,
+          isLink: entry.symlink === true,
+          ...(entry.followed !== undefined ? { followed: entry.followed } : {}),
+        }))
+      : await listFollowingSymlinks((await this.getSftp(alias)) as unknown as SftpListing, path)
     return listed
       .map((entry): RemoteDirEntry => {
         const view = entry.followed ?? entry.attrs

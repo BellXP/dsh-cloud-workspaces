@@ -54,6 +54,7 @@ DSH's agent runs on your local machine. When your code, data or production box l
 
 - ssh2 connection pooling with keepalive, broken-connection detection and transparent rebuild.
 - Per-host latency-tested `test` endpoint reused by both the settings card and the picker.
+- **Nodes whose login shell talks or stalls are handled on the client side, so the node never has to be changed.** sshd starts the SFTP subsystem through the login shell: a shell that prints a banner to stdout corrupts the SFTP stream, so everything before the server's `VERSION` packet is dropped (`sftp-preamble.ts`). An SFTP `READDIR` the server never answers — or that kills the server process, as the Huawei Cloud ModelArts Ascend image does for the home directory — switches that host to listing through one long-lived helper shell (`find`, NUL-framed), and the switch sticks for the connection. The helper shell pays the login shell once (15 s on such an image, where every `exec` channel otherwise pays it again) and then answers in milliseconds.
 
 ### Security
 

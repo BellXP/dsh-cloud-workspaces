@@ -2,6 +2,19 @@
 
 All notable changes to `dsh-cloud-workspaces` are documented here.
 
+## [v0.10.8] — 2026-11-27
+
+### Fixed
+- **Workspaces on nodes whose login shell misbehaves over SSH (Huawei Cloud ModelArts Ascend images), without touching the node.** Two independent faults, both reproduced on two fresh `dmtp-debug` nodes:
+  - *The SFTP stream arrived pre-polluted.* sshd runs the subsystem as `$SHELL -c sftp-server`, and bash reads `~/.bashrc` whenever `SSH_CLIENT` is in the environment — no matter whether stdin is a socket or a pty. That file printed a banner to stdout, so ssh2 read ` __ ` as a packet length: `Packet length 543121184 exceeds max length of 262144` (OpenSSH's sftp: `Received message too long`). `sftp-preamble.ts` now hooks ssh2's `SFTP.prototype.push` (the single entry for inbound data) and drops everything before the first well-formed `SSH_FXP_VERSION` packet; a quiet shell loses zero bytes. It gives up after 256 KiB and when ssh2's internal layout is not recognised.
+  - *`READDIR` of the home directory never came back.* The image's `sftp-server` stops answering (or dies) for that one directory; other directories are fine. `installResilientReaddir` (`sftp-list.ts`) wraps the session's `readdir`: no answer within `sftpReaddirTimeoutMs` (default 8 s), or a session-type error, drops the SFTP session, lists through the helper shell and marks the host; afterwards every listing on that connection goes straight to the shell and `engine.ls` no longer opens SFTP first. Real errors (missing, permission) are reported as before.
+- **The first version of that fallback killed the whole SSH connection** (`cb is not a function`): ssh2's `readdir` pages a directory by re-invoking `this.readdir(where, opts, cb)` with a state object, and the wrapper mistook that continuation for a new listing. Continuation calls are now passed through untouched; a regression test emulates the paging.
+
+### Added
+- **`UtilityShell`**: one long-lived `bash --noprofile --norc` channel per connection for the engine's own small commands, NUL-free sentinel framing (`__DSH_REMOTE_IDE_EXIT__<code>__`), strictly serialised, closed on a timeout and reopened on the next call. On the Ascend image every `exec` channel costs a 15 s login shell (the rc file imports torch twice); the helper shell pays it once and then runs `find` in ~130 ms. Not yet used for `exec` itself.
+- `EngineOptions.sftpReaddirTimeoutMs`.
+- Tests (+22, 219 total): `sftp-resilience` (preamble gate incl. split packets and overflow, `find` output parsing with banners / CRLF / odd names, dangling and resolved links without extra `stat`, the resilient `readdir` in all five modes incl. ssh2's continuation calls) and `engine-resilience` (the switch landing on the connection record, later `ls` skipping SFTP, the helper shell's framing / serialisation / timeout-reopen / closed-shell reporting).
+
 ## [v0.10.7] — 2026-11-27
 
 ### Fixed
