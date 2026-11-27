@@ -30,7 +30,14 @@ const fake = vi.hoisted(() => {
     stderr = new Emitter()
     written = ''
     onWrite?: (data: string) => void
-    write(data: string) { this.written += data; this.onWrite?.(data) }
+    write(data: string) {
+      this.written += data
+      this.onWrite?.(data)
+      // 就绪探针（engine 打开辅助 shell 后的第一笔写入）：像真实 shell 一样回显标记。
+      if (data.includes('__DSH_REMOTE_IDE_READY__')) {
+        queueMicrotask(() => this.emit('data', Buffer.from('\n__DSH_REMOTE_IDE_READY__\n')))
+      }
+    }
     close() { this.emit('close', 0) }
     /** 模拟远端执行一条命令并打出哨兵。 */
     answer(output: string, code = 0) { this.emit('data', Buffer.from(`${output}\n__DSH_REMOTE_IDE_EXIT__${code}__\n`)) }
@@ -152,6 +159,44 @@ describe('UtilityShell: one long-lived helper channel per connection', () => {
     const result = await pending
     expect(result.success).toBe(false)
     expect(result.error).toMatch(/closed/)
+    engine.dispose()
+  })
+
+  it('a slow login preamble (banner before the --norc shell reads) is dropped and never counted against the first command', async () => {
+    const engine = newEngine()
+    await engine.connect('dev')
+    const client = fake.FakeClient.last
+    // 模拟 ModelArts：外层登录 rc 先跑（这里用一段异步延迟代替 15 s）并往 stdout 打 banner；
+    // 之后 --norc shell 才读到探针与命令。
+    const opened: fake.FakeChannel[] = []
+    client.exec = ((_command: string, cb: (err: unknown, stream: fake.FakeChannel) => void) => {
+      const channel = new fake.FakeChannel()
+      opened.push(channel)
+      const pending: string[] = []
+      let started = false
+      channel.write = (data: string) => {
+        pending.push(data)
+        if (started) return
+        started = true
+        setTimeout(() => {
+          channel.emit('data', Buffer.from('Using user root\nHuawei Cloud EulerOS 2.0\n')) // banner
+          for (const line of pending) {
+            if (line.includes('__DSH_REMOTE_IDE_READY__')) channel.emit('data', Buffer.from('\n__DSH_REMOTE_IDE_READY__\n'))
+            else channel.emit('data', Buffer.from('\n/home/root\n__DSH_REMOTE_IDE_EXIT__0__\n'))
+          }
+        }, 60)
+      }
+      queueMicrotask(() => cb(null, channel))
+      return client
+    }) as typeof client.exec
+
+    const run = runner(engine)
+    // 就绪前发出的命令只排队：60 ms 的 preamble 不会让 40 ms 的命令超时。
+    const result = await run('dev', 'printf %s "$HOME"', 40)
+    expect(result).toMatchObject({ success: true, exitCode: 0, stdout: '\n/home/root' })
+    expect(result.stdout).not.toContain('Huawei')
+    expect(opened).toHaveLength(1)
+    expect(await engine.resolveHome('dev')).toBe('/home/root')
     engine.dispose()
   })
 })

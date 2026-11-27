@@ -85,6 +85,13 @@ export interface SshConnection {
   readonly home: string | undefined
   /** 在当前连接上执行一条非交互命令。 */
   exec(command: string, options?: { timeoutMs?: number; cwd?: string }): Promise<ExecResult>
+  /**
+   * 控制面小命令（mkdir/chmod/ps/kill…）的快速通道：走连接上常驻的
+   * `bash --noprofile --norc` 辅助 shell，不像独立 exec 通道那样每条都先过远端
+   * 登录 rc（慢主机 15s+）；stderr 丢弃，超时关闭辅助 shell（下次重开）。
+   * 真实连接始终提供；测试桩可省略，调用方需退回 `exec`。
+   */
+  execFast?(command: string, options?: { timeoutMs?: number }): Promise<ExecResult>
   /** 打开一个低层流式命令通道（subprocess-ssh 的 wrapper 传输）。 */
   execChannel(command: string, options?: { cwd?: string }): Promise<SshExecChannel>
   /**
@@ -414,6 +421,7 @@ export class SshRuntime extends Service {
         return engine.homeOf(alias)
       },
       exec: (command, options) => engine.exec(alias, command, options),
+      execFast: (command, options) => engine.execUtility(alias, command, options?.timeoutMs ?? 10_000),
       execChannel: (command, options) => engine.openChannel(alias, command, options),
       openShell: (cols, rows, command) => engine.openShell(alias, cols, rows, command),
       ls: (path) => engine.ls(alias, path),

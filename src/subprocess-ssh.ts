@@ -81,6 +81,26 @@ function bashCommand(script: string): string {
   return `exec bash -c ${quoteShellArg(script)}`
 }
 
+/**
+ * 控制面小命令（mkdir/chmod/rm/ps/kill/test…，只看 stdout）。独立 exec 通道在慢
+ * profile 主机上每条都先过远端登录 rc（ModelArts Ascend 镜像 ~15s），10s 超时必败
+ * → 终端 bootstrap / 进程组管理全部失效。连接提供快速通道时走常驻
+ * `--noprofile --norc` 辅助 shell：rc 只付一次。不能用 `exec bash -c`（会替换掉
+ * 常驻 shell），cwd 经子 shell 进入以免污染常驻 shell 的目录。无快速通道（测试桩）
+ * 退回独立 exec 通道，行为不变。
+ */
+async function controlExec(
+  connection: SshConnection,
+  script: string,
+  options?: { timeoutMs?: number; cwd?: string },
+): Promise<Awaited<ReturnType<SshConnection['exec']>>> {
+  if (connection.execFast !== undefined) {
+    const body = options?.cwd !== undefined ? `(cd ${quoteShellArg(options.cwd)} && ${script})` : script
+    return await connection.execFast(`bash -c ${quoteShellArg(body)}`, { timeoutMs: options?.timeoutMs ?? 10_000 })
+  }
+  return await connection.exec(bashCommand(script), options)
+}
+
 function isCollect(mode: SubprocessOutputMode): mode is SubprocessCollect {
   return mode !== 'pipe' && mode !== 'inherit'
 }
@@ -137,10 +157,7 @@ function waitWithSignal<T>(promise: Promise<T>, signal: AbortSignal | undefined)
  */
 async function signalRemoteGroups(connection: SshConnection, groups: readonly number[], signal: 'TERM' | 'KILL'): Promise<void> {
   try {
-    await connection.exec(
-      bashCommand(`kill -${signal} -- ${groups.map(group => `-${group}`).join(' ')}`),
-      { timeoutMs: 10_000 },
-    )
+    await controlExec(connection, `kill -${signal} -- ${groups.map(group => `-${group}`).join(' ')}`)
   } catch {
     // A vanished group or a broken control connection both settle here; the
     // following liveness polling remains authoritative.
@@ -178,13 +195,16 @@ async function readRemoteEnvironment(connection: SshConnection, signal?: AbortSi
     "printf '\\n'",
     'env -0 | base64 -w 0',
   ].join('; ')
-  const result = await connection.exec(bashCommand(script), { timeoutMs: 10_000 })
+  // 必须走独立 exec 通道：这里要的就是登录 rc 之后的完整环境（--norc 辅助 shell
+  // 拿到的是裸 sshd 环境）。慢 profile 主机该通道 ~15s+，超时放宽；rc 打印的
+  // banner（ModelArts 登录横幅）会混进 stdout，只取最后两行合法 base64。
+  const result = await connection.exec(bashCommand(script), { timeoutMs: 60_000 })
   signal?.throwIfAborted()
-  const lines = result.stdout.trim().split('\n')
-  if (lines.length !== 2 || !lines.every(line => BASE64.test(line))) {
+  const lines = result.stdout.split('\n').map((line) => line.trim()).filter((line) => line.length > 0 && BASE64.test(line))
+  if (lines.length < 2) {
     throw new Error('subprocess-ssh: remote environment transport returned invalid base64')
   }
-  const [encodedHome, encodedEnvironment] = lines as [string, string]
+  const [encodedHome, encodedEnvironment] = lines.slice(-2) as [string, string]
   let home: string
   let raw: string
   try {
@@ -627,10 +647,7 @@ export class SshSubprocessHandle implements SubprocessHandle {
     // creation must still enter cleanup (rm -rf tolerates an absent path).
     this.stateDirectoryCreated = true
     const environment = serializeRemoteEnvironment(ambient, this.spec.env)
-    await connection.exec(
-      bashCommand(`mkdir -p ${quoteShellArg(this.stateDir)} && chmod 700 ${quoteShellArg(this.stateDir)}`),
-      { timeoutMs: 10_000 },
-    )
+    await controlExec(connection, `mkdir -p ${quoteShellArg(this.stateDir)} && chmod 700 ${quoteShellArg(this.stateDir)}`)
     const sftp = await connection.getSftp()
     await new Promise<void>((resolve, reject) => {
       sftp.writeFile(this.paths.environment, Buffer.from(environment, 'utf8'), (error) => {
@@ -638,7 +655,7 @@ export class SshSubprocessHandle implements SubprocessHandle {
         else resolve()
       })
     })
-    await connection.exec(bashCommand(`chmod 600 ${quoteShellArg(this.paths.environment)}`), { timeoutMs: 10_000 })
+    await controlExec(connection, `chmod 600 ${quoteShellArg(this.paths.environment)}`)
     signal.throwIfAborted()
   }
 
@@ -830,7 +847,7 @@ export class SshSubprocessHandle implements SubprocessHandle {
 
   private async groupAlive(connection: SshConnection, pid: number, signal?: AbortSignal): Promise<boolean> {
     const script = `set -o pipefail; ps -eo pgid=,stat= | awk '$1 == ${pid} && $2 !~ /^[ZXx]/ { live=1 } END { if (live) print "live" }'`
-    const result = await connection.exec(bashCommand(script), { timeoutMs: 10_000 })
+    const result = await controlExec(connection, script)
     return signal?.aborted === true ? false : result.stdout.trim() === 'live'
   }
 
@@ -855,7 +872,7 @@ export class SshSubprocessHandle implements SubprocessHandle {
   private async removeFailedState(): Promise<void> {
     try {
       const connection = await this.runtime.connectionFor(this.spec.cwd)
-      await connection.exec(bashCommand(`rm -rf -- ${quoteShellArg(this.stateDir)}`), { timeoutMs: 10_000 })
+      await controlExec(connection, `rm -rf -- ${quoteShellArg(this.stateDir)}`)
     } catch {
       // The command outcome is authoritative; owner teardown bounds private residue.
     }
@@ -946,13 +963,13 @@ function parsePositiveId(value: string, message: string): number {
 }
 
 async function terminalSessionId(connection: SshConnection, pid: number): Promise<number> {
-  const result = await connection.exec(bashCommand(`ps -o sid= -p ${pid}`), { timeoutMs: 10_000 })
+  const result = await controlExec(connection, `ps -o sid= -p ${pid}`)
   return parsePositiveId(result.stdout, `subprocess-ssh: cannot resolve process session for terminal ${pid}`)
 }
 
 async function sessionProcessGroups(connection: SshConnection, sessionId: number): Promise<number[]> {
   const script = `set -o pipefail; ps -eo sid=,pgid=,stat= | awk '$1 == ${sessionId} && $3 !~ /^[ZXx]/ { print $2 }'`
-  const result = await connection.exec(bashCommand(script), { timeoutMs: 10_000 })
+  const result = await controlExec(connection, script)
   const groups = new Set<number>()
   for (const raw of result.stdout.trim().split(/\s+/)) {
     if (raw.length === 0) continue
@@ -1134,7 +1151,7 @@ export class SshTerminalHandle implements SubprocessTerminalHandle {
   private async inspectForegroundOnce(
     signal: AbortSignal,
   ): Promise<SubprocessTerminalForeground | undefined> {
-    const result = await this.connection.exec(bashCommand(`ps -o tpgid= -p ${this.pid}`), { timeoutMs: 10_000 })
+    const result = await controlExec(this.connection, `ps -o tpgid= -p ${this.pid}`)
     if (signal.aborted || this.topLevelExited || result.exitCode !== 0) return undefined
     return {
       processGroupId: parsePositiveId(
@@ -1191,7 +1208,7 @@ export class SshTerminalHandle implements SubprocessTerminalHandle {
     }
     this.shell.close()
     try {
-      await this.connection.exec(bashCommand(`rm -rf -- ${quoteShellArg(this.stateDir)}`), { timeoutMs: 10_000 })
+      await controlExec(this.connection, `rm -rf -- ${quoteShellArg(this.stateDir)}`)
     } catch {
       // The terminal is quiescent; owner teardown bounds private residue.
     }
@@ -1222,10 +1239,7 @@ export async function spawnSshTerminal(
   let shell: ShellSession | undefined
   let stateDirectoryCreated = false
   try {
-    await connection.exec(
-      bashCommand(`mkdir -p ${quoteShellArg(stateDir)} && chmod 700 ${quoteShellArg(stateDir)}`),
-      { timeoutMs: 10_000 },
-    )
+    await controlExec(connection, `mkdir -p ${quoteShellArg(stateDir)} && chmod 700 ${quoteShellArg(stateDir)}`)
     stateDirectoryCreated = true
     spec.signal?.throwIfAborted()
     // envScript（登录环境快照）：非登录交互 shell + 引导时 source 快照——
@@ -1283,7 +1297,7 @@ export async function spawnSshTerminal(
     }
     if (stateDirectoryCreated) {
       try {
-        await connection.exec(bashCommand(`rm -rf -- ${quoteShellArg(stateDir)}`), { timeoutMs: 10_000 })
+        await controlExec(connection, `rm -rf -- ${quoteShellArg(stateDir)}`)
       } catch (cleanupError) {
         failures.push(asError(cleanupError))
       }
@@ -1436,7 +1450,7 @@ export class SshSubprocessRuntime extends SubprocessRuntime {
     const connection = await this.ctx.ssh.getConnection()
     if (posix.isAbsolute(command)) {
       const script = `test -f ${quoteShellArg(command)} -a -x ${quoteShellArg(command)}`
-      const result = await connection.exec(bashCommand(script), { timeoutMs: 10_000 })
+      const result = await controlExec(connection, script)
       signal?.throwIfAborted()
       if (!result.success) {
         throw new Error(`subprocess-ssh: executable ${JSON.stringify(command)} is not an executable file`)
@@ -1453,10 +1467,7 @@ export class SshSubprocessRuntime extends SubprocessRuntime {
     // SSH has no shared remote cwd, so PATH lookups run relative to the login
     // home (getent-derived; see readRemoteEnvironment).
     const home = connection.home ?? '/'
-    const result = await connection.exec(
-      bashCommand(`${prefix}command -v -- ${quoteShellArg(command)}`),
-      { cwd: home, timeoutMs: 10_000 },
-    )
+    const result = await controlExec(connection, `${prefix}command -v -- ${quoteShellArg(command)}`, { cwd: home })
     signal?.throwIfAborted()
     const executable = result.stdout.trim()
     if (executable.includes('\n') || (!posix.isAbsolute(executable) && !executable.includes('/'))) {
@@ -1474,9 +1485,9 @@ export class SshSubprocessRuntime extends SubprocessRuntime {
   async terminalEnvironment(signal?: AbortSignal): Promise<SubprocessTerminalEnvironment> {
     signal?.throwIfAborted()
     const connection = await this.ctx.ssh.getConnection()
-    const result = await connection.exec(
-      bashCommand('dsh_shell="$(getent passwd "$(id -u)" | cut -d: -f7)"; printf \'%s\' "$dsh_shell"'),
-      { timeoutMs: 10_000 },
+    const result = await controlExec(
+      connection,
+      'dsh_shell="$(getent passwd "$(id -u)" | cut -d: -f7)"; printf \'%s\' "$dsh_shell"',
     )
     signal?.throwIfAborted()
     const defaultShell = result.success ? result.stdout.trim() : ''

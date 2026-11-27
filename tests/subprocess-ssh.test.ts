@@ -92,6 +92,51 @@ const fake = vi.hoisted(() => {
     }
   }
 
+  /**
+   * 常驻 `bash --noprofile --norc` 辅助 shell 通道（engine 的 UtilityShell 底层）：
+   * engine 写入 `<cmd>; printf '\n__DSH_REMOTE_IDE_EXIT__$?__\n'`，这里解开
+   * controlExec 的 `bash -c '<body>'`（可带 `(cd '<dir>' && …)` 子 shell 前缀），
+   * 交给 execScript 执行，并以哨兵行应答（与真实 shell 一致：stdout 原样 + 换行 + 哨兵）。
+   */
+  class FakeUtilityShell extends MiniEmitter {
+    stderr = new MiniEmitter()
+    closed = false
+    write(data: string) {
+      // 就绪探针（engine 打开辅助 shell 后的第一笔写入）：像真实 shell 一样回显标记，
+      // 之后的每笔写入才是一条控制命令。
+      if (data.includes('__DSH_REMOTE_IDE_READY__')) {
+        queueMicrotask(() => { if (!this.closed) this.emit('data', Buffer.from('\n__DSH_REMOTE_IDE_READY__\n')) })
+        return
+      }
+      state.utilityCalls.push(data)
+      queueMicrotask(() => {
+        if (this.closed) return
+        const line = data.trim()
+        const sentinel = line.lastIndexOf("; printf '\\n__DSH_REMOTE_IDE_EXIT__")
+        const body = sentinel === -1 ? line : line.slice(0, sentinel)
+        const unquote = (q: string) => q.replace(/'\\''/g, "'")
+        const bashC = /^bash -c '([\s\S]*)'$/.exec(body)
+        const quoted = bashC === null ? undefined : unquote(bashC[1]!)
+        // controlExec 的 cwd 经 `(cd '<dir>' && …)` 子 shell 进入；剥掉后交给 execScript。
+        const subshell = quoted === undefined ? null : /^\(cd '([^']*)' && ([\s\S]+)\)$/.exec(quoted)
+        const script = quoted === undefined ? undefined : subshell === null ? quoted : subshell[2]!
+        state.utilityCwds.push(quoted !== undefined && subshell !== null ? subshell[1]! : undefined)
+        const direct = script === undefined ? undefined : execScript(`exec bash -c '${script.replace(/'/g, "'\\''")}'`)
+        const code = direct === undefined || direct === null ? '?' : String(direct.exitCode)
+        const out = direct === undefined || direct === null ? '' : direct.stdout
+        this.emit('data', Buffer.from(`${out}\n__DSH_REMOTE_IDE_EXIT__${code}__\n`))
+      })
+    }
+    setWindow() {}
+    pause() {}
+    resume() {}
+    close() {
+      if (this.closed) return
+      this.closed = true
+      this.emit('close')
+    }
+  }
+
   interface FakeFile { kind: 'file'; content: Buffer; mode: number; mtime: number }
   interface FakeDir { kind: 'dir'; mode: number; mtime: number }
   type FakeNode = FakeFile | FakeDir
@@ -204,6 +249,9 @@ const fake = vi.hoisted(() => {
     loginShell: '/bin/bash',
     kills: [] as Array<{ signal: string; args: string }>,
     execCalls: [] as string[],
+  /** 辅助 shell（--noprofile --norc）收到的每一行控制命令，及其中子 shell 前缀携带的 cwd（无则 undefined）。 */
+  utilityCalls: [] as string[],
+  utilityCwds: [] as Array<string | undefined>,
     channels: [] as FakeStream[],
     shells: [] as FakeShell[],
   }
@@ -339,6 +387,8 @@ const fake = vi.hoisted(() => {
     state.foregroundPid = undefined
     state.kills = []
     state.execCalls = []
+    state.utilityCalls = []
+    state.utilityCwds = []
     state.channels = []
     state.shells = []
     state.loginShell = '/bin/bash'
@@ -357,6 +407,12 @@ const fake = vi.hoisted(() => {
       this.exec.mockImplementation((command: string, optionsOrCb: unknown, maybeCb?: unknown) => {
         const cb = (typeof optionsOrCb === 'function' ? optionsOrCb : maybeCb) as (err: unknown, stream: FakeStream) => void
         state.execCalls.push(command)
+        // 常驻辅助 shell（engine 的 UtilityShell）：不自动应答，等 engine 写命令。
+        if (command === 'bash --noprofile --norc') {
+          const shell = new FakeUtilityShell()
+          queueMicrotask(() => cb(null, shell as unknown as FakeStream))
+          return this
+        }
         // PTY exec（终端快速路径，login-env.ts）：行为等同 shell 请求——
         // 返回一个会回显 marker 的 FakeShell 通道。
         if (typeof optionsOrCb === 'object' && optionsOrCb !== null && 'pty' in optionsOrCb) {
@@ -538,8 +594,12 @@ describe('SshSubprocessRuntime 远程 subprocess', () => {
 
     const withPath = await subprocess.resolveExecutable('custom-tool', { PATH: '/opt/bin' })
     expect(withPath).toBe('/usr/bin/custom-tool')
-    const pathPrefix = fake.state.execCalls.find(call => call.includes('command -v') && call.includes('custom-tool'))
+    // 控制命令走常驻辅助 shell（不经独立 exec 通道）；cwd 基准经子 shell 前缀传入。
+    const pathPrefix = fake.state.utilityCalls.find(call => call.includes('command -v') && call.includes('custom-tool'))
     expect(pathPrefix).toContain('/opt/bin')
+    // cwd 基准 = 登录 home，经子 shell 前缀传入（不污染常驻 shell 的目录）。
+    expect(fake.state.utilityCwds.filter(cwd => cwd !== undefined)).toEqual(['/home/dev', '/home/dev'])
+    expect(fake.state.execCalls.some(call => call.includes('command -v'))).toBe(false)
     await fiber.dispose()
   })
 
@@ -779,6 +839,12 @@ describe('SshSubprocessRuntime 远程 subprocess', () => {
 
     const handle = await promise
     expect(handle.pid).toBe(4242)
+    // 控制面（stateDir mkdir、ps -o sid）走常驻 --noprofile --norc 辅助 shell：
+    // 慢 profile 主机上独立 exec 通道每条 ~15s，10s 超时曾让终端永远打不开。
+    expect(fake.state.utilityCalls.some(call => call.includes('mkdir -p') && call.includes('/dsh-ssh-terminals/'))).toBe(true)
+    expect(fake.state.utilityCalls.some(call => call.includes('ps -o sid= -p 4242'))).toBe(true)
+    expect(fake.state.execCalls.some(call => call.includes('mkdir -p'))).toBe(false)
+    expect(fake.state.execCalls.some(call => call.includes('ps -o sid='))).toBe(false)
 
     const chunks: Buffer[] = []
     handle.output.on('data', (chunk: Buffer) => chunks.push(chunk))
@@ -814,7 +880,7 @@ describe('SshSubprocessRuntime 远程 subprocess', () => {
     expect(injected).toContain(`[ -f '${envScript}' ] && . '${envScript}'`)
     expect(injected).toContain(`cd '/home/dev/project'`)
     // 快速通道：PTY exec 非登录 bash，且未走 shell 请求（登录 shell）。
-    const ptyExec = fake.state.execCalls.find((command) => command.includes('--noprofile'))
+    const ptyExec = fake.state.execCalls.find((command) => command.includes('--noprofile --norc -i'))
     expect(ptyExec).toContain('bash --noprofile --norc -i')
     expect(fake.FakeClient.instances[0]!.shell).not.toHaveBeenCalled()
 

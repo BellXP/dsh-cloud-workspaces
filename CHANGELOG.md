@@ -2,6 +2,17 @@
 
 All notable changes to `dsh-cloud-workspaces` are documented here.
 
+## [v0.10.11] — 2026-11-27
+
+### Fixed
+- **The sidebar terminal never opened on ModelArts Ascend nodes (`dmtp-debug`), and the login-environment snapshot was never captured.** Every control-plane command the subprocess adapter issues around a terminal (state-dir `mkdir`/`chmod`, `ps -o sid=`, `ps -o tpgid=`, `kill`, `rm -rf`, `command -v`, the login-shell probe) ran on its own exec channel with a 10 s timeout, and every exec channel on those nodes first pays the remote login `~/.bashrc` (~15 s: the Ascend image imports torch twice). `resolveHome` failed the same way, so `captureLoginEnv` never ran and the terminal could not take the snapshot fast path either. All of these commands now go through the connection's persistent `bash --noprofile --norc` helper shell (`SshConnection.execFast`), which pays the rc once; a `cwd` is applied through a `(cd … && …)` subshell so the helper's own directory is never moved, and `resolveHome` tries the helper first and falls back to a plain exec with a 30 s timeout. Measured on `dmtp-debug`: control commands dropped from 10 s timeouts to ~130 ms, the snapshot is captured, and the terminal opens in ~17 s (the one PTY channel still pays the login rc) with the conda environment restored.
+- **The helper shell's first command could time out or return the login banner.** sshd starts the helper through the login shell, so the banner lands on the helper's stdout and the helper reads nothing until the rc finishes; a command queued right away raced the rc. `openUtilityShell` now writes a `__DSH_REMOTE_IDE_READY__` probe when the channel opens, drops everything before its echo, and only then starts queued commands; readiness waits up to 120 s, decoupled from per-command timeouts. `resolveHome` additionally takes the last non-empty line of the answer.
+- **`readRemoteEnvironment` failed on hosts that print a login banner** (`remote environment transport returned invalid base64`): the banner lines preceded the two base64 lines. The parser now keeps the last two valid base64 lines and the exec timeout rose to 60 s; the command deliberately stays on a login exec channel because the login environment is what it snapshots.
+
+### Added
+- `SshConnection.execFast` (optional on the interface so existing stubs keep working; always present on real connections).
+- Tests (+1, 222 total): the helper shell drops a slow login preamble without charging it to the first command and resolves `$HOME` from the clean answer; the terminal bootstrap's `mkdir` and `ps` run on the helper shell rather than exec channels; `command -v` carries its `cwd` through the subshell prefix.
+
 ## [v0.10.10] — 2026-11-27
 
 ### Fixed

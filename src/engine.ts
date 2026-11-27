@@ -117,6 +117,18 @@ export interface UtilityShell {
 
 const UTILITY_SENTINEL = '__DSH_REMOTE_IDE_EXIT__'
 const UTILITY_DONE = new RegExp(`\\n${UTILITY_SENTINEL}(\\d+|\\?)__\\n`)
+/** 就绪探针回显：辅助 shell 真正开始读我们写的行时打出（见 openUtilityShell）。 */
+const UTILITY_READY_MARKER = '\n__DSH_REMOTE_IDE_READY__\n'
+/** 就绪等待上限：要容得下最慢的登录 rc（ Ascend 镜像 ~15 s，老机器更长）。 */
+const UTILITY_READY_TIMEOUT_MS = 120_000
+/** 就绪前允许丢弃的前导输出上限（banner 很短；超出说明对端不是我们起的 shell）。 */
+const UTILITY_PREAMBLE_LIMIT = 256 * 1024
+
+/** 最后一行非空输出：独立 exec 通道会先打出登录 banner（ModelArts 横幅）。 */
+function lastLine(text: string): string | undefined {
+  const lines = text.split('\n').map((line) => line.trim()).filter((line) => line.length > 0)
+  return lines.length === 0 ? undefined : lines[lines.length - 1]
+}
 
 function openUtilityShell(client: Client, onClosed: () => void): Promise<UtilityShell> {
   return new Promise<UtilityShell>((resolve, reject) => {
@@ -158,15 +170,23 @@ function openUtilityShell(client: Client, onClosed: () => void): Promise<Utility
         }
         onClosed()
       }
+      /** 写失败（通道已坏 / 对端不可写）等于 shell 关闭：排队命令全部失败，下次重开。 */
+      const safeWrite = (data: string): void => {
+        try {
+          stream.write(data)
+        } catch {
+          failAll('utility shell channel write failed')
+        }
+      }
       const pump = (): void => {
-        if (current !== undefined) return
+        if (current !== undefined || !ready) return
         const job = queue.shift()
         if (job === undefined) return
         current = job
         job.timer = setTimeout(() => failAll('utility shell command timed out; the shell was closed and reopens on the next call', job), job.timeoutMs)
-        stream.write(`${job.command}; printf '\\n${UTILITY_SENTINEL}%s__\\n' "$?"\n`)
+        safeWrite(`${job.command}; printf '\\n${UTILITY_SENTINEL}%s__\\n' "$?"\n`)
       }
-      stream.on('data', (chunk: Buffer) => {
+      const onJobData = (chunk: Buffer): void => {
         if (current === undefined) return
         current.buffer += chunk.toString('utf8')
         const match = UTILITY_DONE.exec(current.buffer)
@@ -177,10 +197,42 @@ function openUtilityShell(client: Client, onClosed: () => void): Promise<Utility
         const code = match[1] === '?' ? null : Number(match[1])
         job.resolve({ success: code === 0, exitCode: code, timedOut: false, stdout: job.buffer.slice(0, match.index), stderr: '', durationMs: Date.now() - job.started })
         pump()
+      }
+      // 就绪门：通道由 sshd 经登录 shell 拉起，外层 rc 先跑（Ascend 镜像 ~15 s，还会往
+      // stdout 打 banner），我们的 --norc shell 要等它结束才读到第一行。先发一条 READY
+      // 探针，丢弃标记之前的全部输出：首条命令既不会超时，也不会把 banner 当成结果。
+      // 就绪等待与命令超时解耦（UTILITY_READY_TIMEOUT_MS）；排队中的命令在就绪后才发出。
+      let ready = false
+      let prelude = ''
+      const readyTimer = setTimeout(() => {
+        if (!ready) failAll(`utility shell did not become ready within ${UTILITY_READY_TIMEOUT_MS} ms`)
+      }, UTILITY_READY_TIMEOUT_MS)
+      stream.on('data', (chunk: Buffer) => {
+        if (ready) {
+          onJobData(chunk)
+          return
+        }
+        prelude += chunk.toString('utf8')
+        const at = prelude.indexOf(UTILITY_READY_MARKER)
+        if (at === -1) {
+          if (prelude.length > UTILITY_PREAMBLE_LIMIT) failAll('utility shell preamble exceeded its limit before becoming ready')
+          return
+        }
+        ready = true
+        clearTimeout(readyTimer)
+        const rest = prelude.slice(at + UTILITY_READY_MARKER.length)
+        prelude = ''
+        if (closed) return
+        if (rest.length > 0) onJobData(Buffer.from(rest, 'utf8'))
+        pump()
       })
       stream.stderr.on('data', () => {})
-      stream.on('close', () => failAll('utility shell closed'))
+      stream.on('close', () => {
+        clearTimeout(readyTimer)
+        failAll('utility shell closed')
+      })
       stream.on('error', () => failAll('utility shell channel error'))
+      safeWrite(`printf '${UTILITY_READY_MARKER.replace(/\n/g, '\\n')}'\n`)
       resolve({
         run: (command, timeoutMs) =>
           new Promise<ExecResult>((res) => {
@@ -893,9 +945,20 @@ export class SshEngine {
   async resolveHome(alias: string): Promise<string | undefined> {
     const record = await this.ensureConnection(alias)
     if (record.home !== undefined) return record.home
+    // 每个独立 exec 通道都要先过远端登录 rc（ModelArts Ascend 镜像 ~15s：banner +
+    // import torch），10s 必超时 → home 永远解析不出 → 登录环境快照捕获失败 →
+    // 终端只能走慢速登录 shell 路径。先走常驻 --noprofile --norc 辅助 shell（rc 只
+    // 付一次），不可用再退回独立 exec 并放宽超时。
     try {
-      const home = await this.exec(alias, 'printf %s "$HOME"', { timeoutMs: 10_000 })
-      record.home = home.stdout.trim() || undefined
+      const home = await this.execUtility(alias, 'printf %s "$HOME"', 10_000)
+      record.home = home.success ? lastLine(home.stdout) ?? undefined : undefined
+    } catch {
+      // Non-fatal: fall through to a plain exec channel.
+    }
+    if (record.home !== undefined) return record.home
+    try {
+      const home = await this.exec(alias, 'printf %s "$HOME"', { timeoutMs: 30_000 })
+      record.home = lastLine(home.stdout) ?? undefined
     } catch {
       // Non-fatal: home stays undefined.
     }
@@ -1276,6 +1339,17 @@ export class SshEngine {
    * Run one helper command on the connection's long-lived shell (`UtilityShell`). The shell is
    * opened on first use and reopened after it closes; a command that times out closes it.
    */
+  /**
+   * Run one short control-plane command through the connection's persistent
+   * `bash --noprofile --norc` helper shell. Unlike a fresh exec channel it does
+   * not pay the remote login rc per command (15 s on ModelArts Ascend images);
+   * the rc is paid once when the helper opens. stderr is discarded; a timed-out
+   * command closes the helper, which reopens on the next call.
+   */
+  execUtility(alias: string, command: string, timeoutMs: number): Promise<ExecResult> {
+    return this.runUtility(alias, command, timeoutMs)
+  }
+
   private async runUtility(alias: string, command: string, timeoutMs: number): Promise<ExecResult> {
     const record = await this.ensureConnection(alias)
     record.idleAt = Date.now()
